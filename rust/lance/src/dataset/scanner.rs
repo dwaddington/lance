@@ -53,6 +53,7 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType};
 use lance_index::vector::{Query, DIST_COL};
+use lance_index::ScalarIndexCriteria;
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
@@ -1080,10 +1081,17 @@ impl Scanner {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             if !self.projection_plan.physical_schema.fields.is_empty() {
-                return Err(Error::invalid_input(
-                    "count_rows should not be called on a plan selecting columns".to_string(),
-                    location!(),
-                ));
+                let columns: Vec<&str> = self.projection_plan.physical_schema.fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect();
+
+                let msg = format!(
+                    "count_rows should not be called on a plan selecting columns. selected columns: [{}]",
+                    columns.join(", ")
+                );
+
+                return Err(Error::invalid_input(msg, location!()));
             }
 
             if self.limit.is_some() || self.offset.is_some() {
@@ -1591,7 +1599,11 @@ impl Scanner {
     ) -> Result<bool> {
         let index = self
             .dataset
-            .load_scalar_index_for_column(column)
+            .load_scalar_index(
+                ScalarIndexCriteria::default()
+                    .for_column(column)
+                    .with_type(ScalarIndexType::Inverted),
+            )
             .await?
             .ok_or(Error::invalid_input(
                 format!("Column {} has no inverted index", column),
@@ -1704,7 +1716,14 @@ impl Scanner {
 
             let mut indexed_columns = Vec::new();
             for column in string_columns {
-                let index = self.dataset.load_scalar_index_for_column(column).await?;
+                let index = self
+                    .dataset
+                    .load_scalar_index(
+                        ScalarIndexCriteria::default()
+                            .for_column(column)
+                            .with_type(ScalarIndexType::Inverted),
+                    )
+                    .await?;
                 if let Some(index) = index {
                     let index_type = detect_scalar_index_type(
                         &self.dataset,
@@ -1858,7 +1877,11 @@ impl Scanner {
 
         let index = self
             .dataset
-            .load_scalar_index_for_column(query.column.as_ref().unwrap())
+            .load_scalar_index(
+                ScalarIndexCriteria::default()
+                    .for_column(&column)
+                    .with_type(ScalarIndexType::Inverted),
+            )
             .await?
             .ok_or(Error::invalid_input(
                 format!(
@@ -2123,10 +2146,10 @@ impl Scanner {
             ScalarIndexExpr::Or(lhs, rhs) => Ok(self.fragments_covered_by_index_query(lhs).await?
                 & self.fragments_covered_by_index_query(rhs).await?),
             ScalarIndexExpr::Not(expr) => self.fragments_covered_by_index_query(expr).await,
-            ScalarIndexExpr::Query(column, _) => {
+            ScalarIndexExpr::Query(search) => {
                 let idx = self
                     .dataset
-                    .load_scalar_index_for_column(column)
+                    .load_scalar_index(ScalarIndexCriteria::default().with_name(&search.index_name))
                     .await?
                     .expect("Index not found even though it must have been found earlier");
                 Ok(idx
@@ -5086,7 +5109,7 @@ mod test {
   FilterExec: contains(ngram@1, test string)
     Take: columns=\"_rowid, (ngram), (exact), (no_index)\"
       CoalesceBatchesExec: target_batch_size=8192
-        MaterializeIndex: query=contains(ngram, Utf8(\"test string\"))",
+        MaterializeIndex: query=[contains(ngram, Utf8(\"test string\"))]@ngram_idx",
         )
         .await
         .unwrap();
@@ -5101,7 +5124,7 @@ mod test {
   FilterExec: contains(ngram@1, test string) AND exact@2 < 50
     Take: columns=\"_rowid, (ngram), (exact), (no_index)\"
       CoalesceBatchesExec: target_batch_size=8192
-        MaterializeIndex: query=AND(contains(ngram, Utf8(\"test string\")),exact < 50)",
+        MaterializeIndex: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx,[exact < 50]@exact_idx)",
         )
         .await
         .unwrap();
@@ -5119,7 +5142,7 @@ mod test {
     FilterExec: contains(ngram@1, test string) AND exact@2 < 50 AND no_index@3 > 100
       Take: columns=\"_rowid, (ngram), (exact), (no_index)\"
         CoalesceBatchesExec: target_batch_size=8192
-          MaterializeIndex: query=AND(contains(ngram, Utf8(\"test string\")),exact < 50)",
+          MaterializeIndex: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx,[exact < 50]@exact_idx)",
         )
         .await
         .unwrap();
@@ -5643,7 +5666,7 @@ mod test {
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
           ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-          ScalarIndexQuery: query=i > 10",
+          ScalarIndexQuery: query=[i > 10]@i_idx",
         )
         .await?;
 
@@ -5696,7 +5719,7 @@ mod test {
                     SortExec: TopK(fetch=8), expr=...
                       ANNSubIndex: name=..., k=8, deltas=1
                         ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                        ScalarIndexQuery: query=i > 10",
+                        ScalarIndexQuery: query=[i > 10]@i_idx",
         )
         .await?;
 
@@ -5729,7 +5752,7 @@ mod test {
                     SortExec: TopK(fetch=11), expr=...
                       ANNSubIndex: name=..., k=11, deltas=1
                         ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                        ScalarIndexQuery: query=i > 10",
+                        ScalarIndexQuery: query=[i > 10]@i_idx",
         )
         .await?;
 
@@ -5741,7 +5764,7 @@ mod test {
             "ProjectionExec: expr=[s@1 as s]
   Take: columns=\"_rowid, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
-      MaterializeIndex: query=i > 10",
+      MaterializeIndex: query=[i > 10]@i_idx",
         )
         .await?;
 
@@ -5773,7 +5796,7 @@ mod test {
             },
             "ProjectionExec: expr=[_rowaddr@0 as _rowaddr]
   AddRowAddrExec
-    MaterializeIndex: query=i > 10",
+    MaterializeIndex: query=[i > 10]@i_idx",
         )
         .await?;
 
@@ -5786,7 +5809,7 @@ mod test {
     UnionExec
       Take: columns=\"_rowid, (s)\"
         CoalesceBatchesExec: target_batch_size=8192
-          MaterializeIndex: query=i > 10
+          MaterializeIndex: query=[i > 10]@i_idx
       ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
         FilterExec: i@0 > 10
           LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false",
@@ -5805,7 +5828,7 @@ mod test {
   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
     UnionExec
       AddRowAddrExec
-        MaterializeIndex: query=i > 10
+        MaterializeIndex: query=[i > 10]@i_idx
       ProjectionExec: expr=[_rowaddr@2 as _rowaddr, _rowid@1 as _rowid]
         FilterExec: i@0 > 10
           LanceScan: uri=..., projection=[i], row_id=true, row_addr=true, ordered=false",
@@ -5825,7 +5848,7 @@ mod test {
   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
     UnionExec
       AddRowAddrExec
-        MaterializeIndex: query=i > 10
+        MaterializeIndex: query=[i > 10]@i_idx
       ProjectionExec: expr=[_rowaddr@2 as _rowaddr, _rowid@1 as _rowid]
         FilterExec: i@0 > 10
           LanceScan: uri=..., projection=[i], row_id=true, row_addr=true, ordered=false",
@@ -5846,7 +5869,7 @@ mod test {
       UnionExec
         Take: columns=\"_rowid, (s)\"
           CoalesceBatchesExec: target_batch_size=8192
-            MaterializeIndex: query=i > 10
+            MaterializeIndex: query=[i > 10]@i_idx
         ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
           FilterExec: i@0 > 10
             LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false",
@@ -5925,7 +5948,7 @@ mod test {
       MatchQuery: query=hello
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            MaterializeIndex: query=i > 10
+            MaterializeIndex: query=[i > 10]@i_idx
             ProjectionExec: expr=[_rowid@1 as _rowid]
               FilterExec: i@0 > 10
                 LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false"#,
@@ -5972,7 +5995,7 @@ mod test {
             MatchQuery: query=hello
               RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
                 UnionExec
-                  MaterializeIndex: query=i > 10
+                  MaterializeIndex: query=[i > 10]@i_idx
                   ProjectionExec: expr=[_rowid@1 as _rowid]
                     FilterExec: i@0 > 10
                       LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false
