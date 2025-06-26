@@ -30,7 +30,7 @@ use rand::prelude::*;
 use rayon::prelude::*;
 
 use crate::distance::hamming::{hamming, hamming_distance_batch};
-use crate::distance::{dot_distance_batch, DistanceType};
+use crate::distance::{cosine_distance_batch, dot_distance_batch, Cosine, DistanceType};
 use crate::kernels::{argmax, argmin_value_float};
 use crate::{
     distance::{
@@ -219,7 +219,7 @@ where
 
 impl<T: ArrowNumericType> KMeansAlgo<T::Native> for KMeansAlgoFloat<T>
 where
-    T::Native: Float + Dot + L2 + DivAssign + AddAssign + FromPrimitive + Sync,
+    T::Native: Float + Dot + L2 + Cosine + DivAssign + AddAssign + FromPrimitive + Sync,
 {
     fn compute_membership_and_loss(
         centroids: &[T::Native],
@@ -231,6 +231,10 @@ where
             DistanceType::L2 => data
                 .par_chunks(dimension)
                 .map(|vec| argmin_value_float(l2_distance_batch(vec, centroids, dimension)))
+                .collect::<Vec<_>>(),
+            DistanceType::Cosine => data
+                .par_chunks(dimension)
+                .map(|vec| argmin_value_float(cosine_distance_batch(vec, centroids, dimension)))
                 .collect::<Vec<_>>(),
             DistanceType::Dot => data
                 .par_chunks(dimension)
@@ -648,7 +652,7 @@ pub fn kmeans_find_partitions_arrow_array(
 /// This function allows to conduct kmeans search without constructing
 /// `Arrow Array` or `Vec<Float>` types.
 ///
-pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
+pub fn kmeans_find_partitions<T: Float + L2 + Dot + Cosine>(
     centroids: &[T],
     query: &[T],
     nprobes: usize,
@@ -656,6 +660,7 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
 ) -> Result<UInt32Array> {
     let dists: Vec<f32> = match distance_type {
         DistanceType::L2 => l2_distance_batch(query, centroids, query.len()).collect(),
+        DistanceType::Cosine => cosine_distance_batch(query, centroids, query.len()).collect(),
         DistanceType::Dot => dot_distance_batch(query, centroids, query.len()).collect(),
         _ => {
             panic!(
