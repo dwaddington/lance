@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! `f32x8`, 8 of `f32` values.s
-
+#![feature(stdarch_x86_avx512)]
 use std::fmt::Formatter;
 
 #[cfg(target_arch = "aarch64")]
