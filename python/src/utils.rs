@@ -26,12 +26,11 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_file::writer::FileWriter;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSW};
-use lance_index::vector::v3::subindex::IvfSubIndex;
-use lance_linalg::kmeans::{compute_partitions, KMeansAlgoFloat};
-use lance_linalg::{
-    distance::DistanceType,
-    kmeans::{KMeans as LanceKMeans, KMeansParams},
+use lance_index::vector::kmeans::{
+    compute_partitions, KMeans as LanceKMeans, KMeansAlgoFloat, KMeansParams,
 };
+use lance_index::vector::v3::subindex::IvfSubIndex;
+use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use pyo3::intern;
@@ -281,5 +280,15 @@ pub fn class_name(ob: &Bound<'_, PyAny>) -> PyResult<String> {
     match full_name.rsplit_once('.') {
         Some((_, name)) => Ok(name.to_string()),
         None => Ok(full_name),
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<&i32> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
+        self.0.into_bound_py_any(py)
     }
 }

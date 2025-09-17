@@ -3,11 +3,7 @@
 
 //! IVF - Inverted File index.
 
-use std::{
-    any::Any,
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
 use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use super::{
@@ -20,7 +16,6 @@ use crate::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use crate::{
     dataset::Dataset,
     index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
-    session::Session,
 };
 use arrow::datatypes::UInt8Type;
 use arrow_arith::numeric::sub;
@@ -40,6 +35,7 @@ use futures::{
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::{
+    cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
     traits::DatasetTakeRows,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
     Error, Result, ROW_ID_FIELD,
@@ -52,6 +48,7 @@ use lance_index::metrics::MetricsCollector;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::utils::is_finite;
@@ -82,7 +79,7 @@ use lance_io::{
 };
 use lance_linalg::distance::{DistanceType, Dot, MetricType, L2};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl};
-use log::{info, warn};
+use log::info;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use serde::Serialize;
@@ -94,6 +91,27 @@ use uuid::Uuid;
 pub mod builder;
 pub mod io;
 pub mod v2;
+
+// Cache wrapper for vector index trait objects
+// Cache key for IVF partitions in the legacy IVF index
+#[derive(Debug, Clone)]
+pub struct LegacyIVFPartitionKey {
+    pub partition_id: usize,
+}
+
+impl LegacyIVFPartitionKey {
+    pub fn new(partition_id: usize) -> Self {
+        Self { partition_id }
+    }
+}
+
+impl UnsizedCacheKey for LegacyIVFPartitionKey {
+    type ValueType = dyn VectorIndex;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("ivf-{}", self.partition_id).into()
+    }
+}
 
 /// IVF Index.
 /// WARNING: Internal API with no stability guarantees.
@@ -112,10 +130,7 @@ pub struct IVFIndex {
 
     pub metric_type: MetricType,
 
-    // The session cache holds an Arc to this object so we need to
-    // hold a weak pointer to avoid cycles
-    /// The session cache, used when fetching pages
-    session: Weak<Session>,
+    index_cache: WeakLanceCache,
 }
 
 impl DeepSizeOf for IVFIndex {
@@ -123,19 +138,18 @@ impl DeepSizeOf for IVFIndex {
         self.uuid.deep_size_of_children(context)
             + self.reader.deep_size_of_children(context)
             + self.sub_index.deep_size_of_children(context)
-        // Skipping session since it is a weak ref
     }
 }
 
 impl IVFIndex {
     /// Create a new IVF index.
     pub(crate) fn try_new(
-        session: Arc<Session>,
         uuid: &str,
         ivf: IvfModel,
         reader: Arc<dyn Reader>,
         sub_index: Arc<dyn VectorIndex>,
         metric_type: MetricType,
+        index_cache: LanceCache,
     ) -> Result<Self> {
         if !sub_index.is_loadable() {
             return Err(Error::Index {
@@ -147,12 +161,12 @@ impl IVFIndex {
         let num_partitions = ivf.num_partitions();
         Ok(Self {
             uuid: uuid.to_owned(),
-            session: Arc::downgrade(&session),
             ivf,
             reader,
             sub_index,
             metric_type,
             partition_locks: PartitionLoadLock::new(num_partitions),
+            index_cache: WeakLanceCache::from(&index_cache),
         })
     }
 
@@ -170,22 +184,20 @@ impl IVFIndex {
         write_cache: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
-        let session = self.session.upgrade().ok_or(Error::Internal {
-            message: "attempt to use index after dataset was destroyed".into(),
-            location: location!(),
-        })?;
-        let part_index = if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
+        let cache_key = LegacyIVFPartitionKey::new(partition_id);
+        let part_index = if let Some(part_idx) =
+            self.index_cache.get_unsized_with_key(&cache_key).await
+        {
             part_idx
         } else {
             metrics.record_part_load();
-            tracing::info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=cache_key);
+            tracing::info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=cache_key.key().as_ref());
 
             let mtx = self.partition_locks.get_partition_mutex(partition_id);
             let _guard = mtx.lock().await;
             // check the cache again, as the partition may have been loaded by another
             // thread that held the lock on loading the partition
-            if let Some(part_idx) = session.index_cache.get_vector(&cache_key) {
+            if let Some(part_idx) = self.index_cache.get_unsized_with_key(&cache_key).await {
                 part_idx
             } else {
                 if partition_id >= self.ivf.num_partitions() {
@@ -211,7 +223,9 @@ impl IVFIndex {
                     .await?;
                 let idx: Arc<dyn VectorIndex> = idx.into();
                 if write_cache {
-                    session.index_cache.insert_vector(&cache_key, idx.clone());
+                    self.index_cache
+                        .insert_unsized_with_key(&cache_key, idx.clone())
+                        .await;
                 }
                 idx
             }
@@ -270,12 +284,6 @@ pub(crate) async fn optimize_vector_indices(
             options,
         )
         .await;
-    }
-
-    if options.retrain {
-        warn!(
-            "optimizing vector index: retrain is only supported for v3 vector indices, falling back to normal optimization. please re-create the index with lance>=0.25.0 to enable retrain."
-        );
     }
 
     let new_uuid = Uuid::new_v4();
@@ -367,13 +375,9 @@ pub(crate) async fn optimize_vector_indices_v2(
     let distance_type = existing_indices[0].metric_type();
     let num_partitions = ivf_model.num_partitions();
     let index_type = existing_indices[0].sub_index_type();
-    let fri = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+    let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
 
-    let num_indices_to_merge = if options.retrain {
-        existing_indices.len()
-    } else {
-        options.num_indices_to_merge
-    };
+    let num_indices_to_merge = options.num_indices_to_merge;
     let temp_dir = tempfile::tempdir()?;
     let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
     let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
@@ -397,12 +401,11 @@ pub(crate) async fn optimize_vector_indices_v2(
                     distance_type,
                     shuffler,
                     (),
-                    fri,
+                    frag_reuse_index,
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(indices_to_merge)
-                .retrain(options.retrain)
                 .shuffle_data(unindexed)
                 .await?
                 .build()
@@ -415,12 +418,11 @@ pub(crate) async fn optimize_vector_indices_v2(
                     distance_type,
                     shuffler,
                     (),
-                    fri,
+                    frag_reuse_index,
                 )?
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(indices_to_merge)
-                .retrain(options.retrain)
                 .shuffle_data(unindexed)
                 .await?
                 .build()
@@ -436,12 +438,30 @@ pub(crate) async fn optimize_vector_indices_v2(
                 distance_type,
                 shuffler,
                 (),
-                fri,
+                frag_reuse_index,
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
-            .retrain(options.retrain)
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?;
+        }
+        // IVF_SQ
+        (SubIndexType::Flat, QuantizationType::Scalar) => {
+            IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                (),
+                frag_reuse_index,
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(indices_to_merge)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -459,12 +479,11 @@ pub(crate) async fn optimize_vector_indices_v2(
                 None,
                 // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
-                fri,
+                frag_reuse_index,
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
-            .retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -482,12 +501,11 @@ pub(crate) async fn optimize_vector_indices_v2(
                 None,
                 // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
-                fri,
+                frag_reuse_index,
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
-            .retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -505,25 +523,15 @@ pub(crate) async fn optimize_vector_indices_v2(
                 None,
                 // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
-                fri,
+                frag_reuse_index,
             )?
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
-            .retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
             .await?;
-        }
-        (sub_index_type, quantizer_type) => {
-            return Err(Error::Index {
-                message: format!(
-                    "optimizing vector index: unsupported index type IVF_{}_{}",
-                    sub_index_type, quantizer_type
-                ),
-                location: location!(),
-            });
         }
     }
 
@@ -1183,23 +1191,24 @@ pub async fn build_ivf_model(
     metric_type: MetricType,
     params: &IvfBuildParams,
 ) -> Result<IvfModel> {
+    let num_partitions = params.num_partitions.unwrap();
     let centroids = params.centroids.clone();
     if centroids.is_some() && !params.retrain {
         let centroids = centroids.unwrap();
         info!("Pre-computed IVF centroids is provided, skip IVF training");
-        if centroids.values().len() != params.num_partitions * dim {
+        if centroids.values().len() != num_partitions * dim {
             return Err(Error::Index {
                 message: format!(
                     "IVF centroids length mismatch: {} != {}",
                     centroids.len(),
-                    params.num_partitions * dim,
+                    num_partitions * dim,
                 ),
                 location: location!(),
             });
         }
         return Ok(IvfModel::new(centroids.as_ref().clone(), None));
     }
-    let sample_size_hint = params.num_partitions * params.sample_rate;
+    let sample_size_hint = num_partitions * params.sample_rate;
 
     let start = std::time::Instant::now();
     info!(
@@ -1244,9 +1253,13 @@ async fn build_ivf_model_and_pq(
 ) -> Result<(IvfModel, ProductQuantizer)> {
     sanity_check_params(ivf_params, pq_params)?;
 
+    // `num_partitions` should be set before building the IVF model,
+    // we use 32 as the default to avoid panicking, 32 is the default value
+    // before we make `num_partitions` optional.
+    let num_partitions = ivf_params.num_partitions.unwrap_or(32);
     info!(
         "Building vector index: IVF{},PQ{}, metric={}",
-        ivf_params.num_partitions, pq_params.num_sub_vectors, metric_type,
+        num_partitions, pq_params.num_sub_vectors, metric_type,
     );
 
     // sanity check
@@ -1736,14 +1749,13 @@ where
     PrimitiveArray<T>: From<Vec<T::Native>>,
 {
     const REDOS: usize = 1;
+    let kmeans_params = KMeansParams::new(centroids, params.max_iters as u32, REDOS, metric_type)
+        .with_balance_factor(1.0);
     let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
-        centroids,
         data,
+        kmeans_params,
         dimension,
-        params.num_partitions,
-        params.max_iters as u32,
-        REDOS,
-        metric_type,
+        params.num_partitions.unwrap_or(32),
         params.sample_rate,
     )?;
     Ok(IvfModel::new(
@@ -1849,15 +1861,16 @@ mod tests {
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
     use lance_core::ROW_ID;
-    use lance_datagen::{array, gen, ArrayGeneratorExt, Dimension, RowCount};
+    use lance_datagen::{array, gen_batch, ArrayGeneratorExt, Dimension, RowCount};
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::VECTOR_INDEX_VERSION;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
         generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
         generate_scaled_random_array, sample_without_replacement,
     };
-    use rand::{seq::SliceRandom, thread_rng};
+    use rand::{rng, seq::SliceRandom};
     use rstest::rstest;
     use tempfile::tempdir;
 
@@ -2159,7 +2172,7 @@ mod tests {
         if num_parts > ids.len() as u32 {
             panic!("Not enough ids to break into {num_parts} parts");
         }
-        let mut rng = thread_rng();
+        let mut rng = rng();
         ids.shuffle(&mut rng);
 
         let values_per_part = ids.len() / num_parts as usize;
@@ -2243,10 +2256,52 @@ mod tests {
         .await
         .unwrap();
 
-        let index = dataset
+        // After building the index file, we need to register the index metadata
+        // so that the dataset can find it when we try to open it
+        let field = dataset.schema().field(WellKnownIvfPqData::COLUMN).unwrap();
+        let index_meta = lance_table::format::Index {
+            uuid,
+            dataset_version: dataset.version().version,
+            fields: vec![field.id],
+            name: INDEX_NAME.to_string(),
+            fragment_bitmap: Some(
+                dataset
+                    .get_fragments()
+                    .iter()
+                    .map(|f| f.id() as u32)
+                    .collect(),
+            ),
+            index_details: Some(Arc::new(vector_index_details())),
+            index_version: VECTOR_INDEX_VERSION as i32,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+        };
+
+        // We need to commit this index to the dataset so that it can be found
+        use crate::dataset::transaction::{Operation, Transaction};
+        let transaction = Transaction::new(
+            dataset.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![index_meta.clone()],
+                removed_indices: vec![],
+            },
+            None,
+            None,
+        );
+
+        // Apply the transaction to register the index
+        // Since dataset is Arc<Dataset>, we need to create a mutable reference
+        let mut dataset_mut = (*dataset).clone();
+        dataset_mut
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let index = dataset_mut
             .open_vector_index(WellKnownIvfPqData::COLUMN, &uuid_str, &NoOpMetricsCollector)
             .await
             .unwrap();
+
         let ivf_index = index.as_any().downcast_ref::<IVFIndex>().unwrap();
 
         let index_meta = lance_table::format::Index {
@@ -2255,9 +2310,10 @@ mod tests {
             fields: Vec::new(),
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
-            index_details: Some(vector_index_details()),
-            index_version: index.index_type().version(),
+            index_details: Some(Arc::new(vector_index_details())),
+            index_version: VECTOR_INDEX_VERSION as i32,
             created_at: None, // Test index, not setting timestamp
+            base_id: None,
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -2288,10 +2344,10 @@ mod tests {
         let new_uuid_str = new_uuid.to_string();
 
         remap_index_file(
-            &dataset,
+            &dataset_mut,
             &uuid_str,
             &new_uuid_str,
-            dataset.version().version,
+            dataset_mut.version().version,
             ivf_index,
             &mapping,
             INDEX_NAME.to_string(),
@@ -2301,7 +2357,48 @@ mod tests {
         .await
         .unwrap();
 
-        let remapped = dataset
+        // After remapping the index file, we need to register the new index metadata
+        // so that the dataset can find it when we try to open it
+        let field = dataset_mut
+            .schema()
+            .field(WellKnownIvfPqData::COLUMN)
+            .unwrap();
+        let new_index_meta = lance_table::format::Index {
+            uuid: new_uuid,
+            dataset_version: dataset_mut.version().version,
+            fields: vec![field.id],
+            name: format!("{}_remapped", INDEX_NAME),
+            fragment_bitmap: Some(
+                dataset_mut
+                    .get_fragments()
+                    .iter()
+                    .map(|f| f.id() as u32)
+                    .collect(),
+            ),
+            index_details: Some(Arc::new(vector_index_details())),
+            index_version: VECTOR_INDEX_VERSION as i32,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+        };
+
+        // We need to commit this new index to the dataset so it can be found
+        let transaction = Transaction::new(
+            dataset_mut.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![new_index_meta],
+                removed_indices: vec![],
+            },
+            None,
+            None,
+        );
+
+        // Apply the transaction to register the new index
+        dataset_mut
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let remapped = dataset_mut
             .open_vector_index(
                 WellKnownIvfPqData::COLUMN,
                 &new_uuid.to_string(),
@@ -2431,7 +2528,7 @@ mod tests {
         index_params.version(index_version);
 
         let nrows = 2_000;
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "vec",
                 array::rand_vec::<Float32Type>(Dimension::from(test_case.dimension as u32)),
@@ -2485,7 +2582,7 @@ mod tests {
         // Generate random data with nulls
         let nrows = 2_000;
         let dims = 32;
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "vec",
                 array::rand_vec::<Float32Type>(Dimension::from(dims as u32)).with_random_nulls(0.5),
@@ -2526,7 +2623,7 @@ mod tests {
         check_index(&dataset, num_non_null, dims).await;
 
         // Append more data
-        let data = gen()
+        let data = gen_batch()
             .col(
                 "vec",
                 array::rand_vec::<Float32Type>(Dimension::from(dims as u32)).with_random_nulls(0.5),

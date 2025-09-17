@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use lance_core::utils::mask::RowIdTreeMap;
@@ -25,6 +26,9 @@ use crate::{
 };
 
 use super::{resolve_commit_handler, WriteDestination};
+use crate::dataset::transaction::validate_operation;
+use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
+use tracing::info;
 
 /// Create a new commit from a [`Transaction`].
 ///
@@ -32,7 +36,7 @@ use super::{resolve_commit_handler, WriteDestination};
 #[derive(Debug, Clone)]
 pub struct CommitBuilder<'a> {
     dest: WriteDestination<'a>,
-    use_move_stable_row_ids: Option<bool>,
+    use_stable_row_ids: Option<bool>,
     enable_v2_manifest_paths: bool,
     storage_format: Option<LanceFileVersion>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
@@ -42,13 +46,14 @@ pub struct CommitBuilder<'a> {
     detached: bool,
     commit_config: CommitConfig,
     affected_rows: Option<RowIdTreeMap>,
+    transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 impl<'a> CommitBuilder<'a> {
     pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
         Self {
             dest: dest.into(),
-            use_move_stable_row_ids: None,
+            use_stable_row_ids: None,
             enable_v2_manifest_paths: false,
             storage_format: None,
             commit_handler: None,
@@ -58,18 +63,19 @@ impl<'a> CommitBuilder<'a> {
             detached: false,
             commit_config: Default::default(),
             affected_rows: None,
+            transaction_properties: None,
         }
     }
 
-    /// Whether to use move-stable row ids. This makes the `_rowid` column stable
+    /// Whether to use stable row ids. This makes the `_rowid` column stable
     /// after compaction, but not updates.
     ///
     /// This is only used for new datasets. Existing datasets will use their
     /// existing setting.
     ///
     /// **Default is false.**
-    pub fn use_move_stable_row_ids(mut self, use_move_stable_row_ids: bool) -> Self {
-        self.use_move_stable_row_ids = Some(use_move_stable_row_ids);
+    pub fn use_stable_row_ids(mut self, use_stable_row_ids: bool) -> Self {
+        self.use_stable_row_ids = Some(use_stable_row_ids);
         self
     }
 
@@ -151,10 +157,26 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    pub fn with_skip_auto_cleanup(mut self, skip_auto_cleanup: bool) -> Self {
+        self.commit_config.skip_auto_cleanup = skip_auto_cleanup;
+        self
+    }
+
     /// Provide the set of row addresses that were deleted or updated. This is
     /// used to perform fast conflict resolution.
     pub fn with_affected_rows(mut self, affected_rows: RowIdTreeMap) -> Self {
         self.affected_rows = Some(affected_rows);
+        self
+    }
+
+    /// provide Configuration key-value pairs associated with this transaction.
+    /// This is used to store metadata about the transaction, such as commit messages, engine information, etc.
+    /// this properties map will be persisted as a part of the transaction object
+    pub fn with_transaction_properties(
+        mut self,
+        transaction_properties: HashMap<String, String>,
+    ) -> Self {
+        self.transaction_properties = Some(Arc::new(transaction_properties));
         self
     }
 
@@ -221,7 +243,11 @@ impl<'a> CommitBuilder<'a> {
             }
         };
 
-        if dest.dataset().is_none() && !matches!(transaction.operation, Operation::Overwrite { .. })
+        if dest.dataset().is_none()
+            && !matches!(
+                transaction.operation,
+                Operation::Overwrite { .. } | Operation::Clone { .. }
+            )
         {
             return Err(Error::DatasetNotFound {
                 path: base_path.to_string(),
@@ -230,9 +256,20 @@ impl<'a> CommitBuilder<'a> {
             });
         }
 
-        let metadata_cache = match &dest {
-            WriteDestination::Dataset(ds) => ds.metadata_cache.clone(),
-            WriteDestination::Uri(uri) => Arc::new(session.metadata_cache.with_key_prefix(uri)),
+        // Validate the operation before proceeding with the commit
+        // This ensures that operations like Merge have proper validation for data integrity
+        if let Some(dataset) = dest.dataset() {
+            validate_operation(Some(&dataset.manifest), &transaction.operation)?;
+        } else {
+            validate_operation(None, &transaction.operation)?;
+        }
+
+        let (metadata_cache, index_cache) = match &dest {
+            WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),
+            WriteDestination::Uri(uri) => (
+                Arc::new(session.metadata_cache.for_dataset(uri)),
+                Arc::new(session.index_cache.for_dataset(uri)),
+            ),
         };
 
         let manifest_naming_scheme = if let Some(ds) = dest.dataset() {
@@ -243,10 +280,10 @@ impl<'a> CommitBuilder<'a> {
             ManifestNamingScheme::V1
         };
 
-        let use_move_stable_row_ids = if let Some(ds) = dest.dataset() {
-            ds.manifest.uses_move_stable_row_ids()
+        let use_stable_row_ids = if let Some(ds) = dest.dataset() {
+            ds.manifest.uses_stable_row_ids()
         } else {
-            self.use_move_stable_row_ids.unwrap_or(false)
+            self.use_stable_row_ids.unwrap_or(false)
         };
 
         // Validate storage format matches existing dataset
@@ -269,7 +306,7 @@ impl<'a> CommitBuilder<'a> {
         }
 
         let manifest_config = ManifestWriteConfig {
-            use_move_stable_row_ids,
+            use_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
             ..Default::default()
         };
@@ -323,17 +360,30 @@ impl<'a> CommitBuilder<'a> {
             .await?
         };
 
+        info!(
+            target: TRACE_DATASET_EVENTS,
+            event=DATASET_COMMITTED_EVENT,
+            uri=dest.uri(),
+            read_version=transaction.read_version,
+            committed_version=manifest.version,
+            detached=self.detached,
+            operation=&transaction.operation.name()
+        );
+
         let tags = Tags::new(
             object_store.clone(),
             commit_handler.clone(),
             base_path.clone(),
         );
 
+        let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
+
         match &self.dest {
             WriteDestination::Dataset(dataset) => Ok(Dataset {
                 manifest: Arc::new(manifest),
                 manifest_location,
                 session,
+                fragment_bitmap,
                 ..dataset.as_ref().clone()
             }),
             WriteDestination::Uri(uri) => Ok(Dataset {
@@ -345,7 +395,10 @@ impl<'a> CommitBuilder<'a> {
                 session,
                 commit_handler,
                 tags,
+                index_cache,
+                fragment_bitmap,
                 metadata_cache,
+                file_reader_options: None,
             }),
         }
     }
@@ -404,6 +457,8 @@ impl<'a> CommitBuilder<'a> {
             read_version,
             blobs_op,
             tag: None,
+            //TODO: handle batch transaction merges in the future
+            transaction_properties: None,
         };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
@@ -448,6 +503,7 @@ mod tests {
                 file_major_version: 2,
                 file_minor_version: 0,
                 file_size_bytes: CachedFileSize::new(100),
+                base_id: None,
             }],
             deletion_file: None,
             row_id_meta: None,
@@ -464,6 +520,7 @@ mod tests {
             read_version,
             blobs_op: None,
             tag: None,
+            transaction_properties: None,
         }
     }
 
@@ -731,10 +788,12 @@ mod tests {
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
                 fields_modified: vec![],
+                mem_wal_to_merge: None,
             },
             read_version: 1,
             blobs_op: None,
             tag: None,
+            transaction_properties: None,
         };
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])

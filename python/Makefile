@@ -1,7 +1,7 @@
 ifeq ($(CI), true)
-    PYTEST_ARGS = -vvv -s --durations=30
+    PYTEST_ARGS = -vvv -s --durations=30 -m "not recurring"
 else
-    PYTEST_ARGS = -vvv -s
+    PYTEST_ARGS = -vvv -s -m "not recurring"
 endif
 
 test:
@@ -20,6 +20,14 @@ format: format-python
 	cargo fmt
 .PHONY: format
 
+build:
+	maturin develop
+.PHONY: build
+
+clean:
+	rm -rf ./target
+.PHONY: clean
+
 format-python:
 	ruff format python
 	ruff check --fix python
@@ -29,7 +37,7 @@ lint: lint-python lint-rust
 .PHONY: lint
 
 lint-python:
-	ruff format --check python
+	ruff format --check --diff python
 	ruff check python
 	pyright
 .PHONY: lint-python

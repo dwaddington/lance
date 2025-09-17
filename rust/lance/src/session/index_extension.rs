@@ -94,7 +94,7 @@ mod test {
 
     impl DeepSizeOf for MockIndex {
         fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-            todo!()
+            0
         }
     }
 
@@ -309,10 +309,6 @@ mod test {
     impl IndexParams for MockIndexParams {
         fn as_any(&self) -> &dyn Any {
             self
-        }
-
-        fn index_type(&self) -> IndexType {
-            IndexType::Vector
         }
 
         fn index_name(&self) -> &str {

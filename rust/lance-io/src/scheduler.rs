@@ -131,7 +131,7 @@ impl IopsQuota {
     }
 
     // Acquire a reservation on the global IOPS quota
-    async fn acquire(&self) -> IopsReservation {
+    async fn acquire(&self) -> IopsReservation<'_> {
         if let Some(iops_avail) = self.iops_avail.as_ref() {
             IopsReservation {
                 value: Some(iops_avail.acquire().await.unwrap()),
@@ -142,9 +142,7 @@ impl IopsQuota {
     }
 }
 
-lazy_static::lazy_static! {
-    static ref IOPS_QUOTA: IopsQuota = IopsQuota::new();
-}
+static IOPS_QUOTA: std::sync::LazyLock<IopsQuota> = std::sync::LazyLock::new(IopsQuota::new);
 
 // We want to allow requests that have a lower priority than any
 // currently in-flight request.  This helps avoid potential deadlocks
@@ -474,6 +472,8 @@ impl IoTask {
     }
 
     async fn run(self) {
+        let file_path = self.reader.path().as_ref();
+        let num_bytes = self.num_bytes();
         let bytes = if self.to_read.start == self.to_read.end {
             Ok(Bytes::new())
         } else {
@@ -481,9 +481,23 @@ impl IoTask {
                 .reader
                 .get_range(self.to_read.start as usize..self.to_read.end as usize);
             IOPS_COUNTER.fetch_add(1, Ordering::Release);
-            BYTES_READ_COUNTER.fetch_add(self.num_bytes(), Ordering::Release);
-            bytes_fut.await.map_err(Error::from)
+            let num_bytes = self.num_bytes();
+            bytes_fut
+                .inspect(move |_| {
+                    BYTES_READ_COUNTER.fetch_add(num_bytes, Ordering::Release);
+                })
+                .await
+                .map_err(Error::from)
         };
+        // Emit per-file I/O trace event only when tracing is enabled
+        tracing::trace!(
+            file = file_path,
+            bytes_read = num_bytes,
+            requests = 1,
+            range_start = self.to_read.start,
+            range_end = self.to_read.end,
+            "File I/O completed"
+        );
         IOPS_QUOTA.release();
         (self.when_done)(bytes);
     }
@@ -957,7 +971,7 @@ mod tests {
         // Write 1MiB of data
         const DATA_SIZE: u64 = 1024 * 1024;
         let mut some_data = vec![0; DATA_SIZE as usize];
-        rand::thread_rng().fill_bytes(&mut some_data);
+        rand::rng().fill_bytes(&mut some_data);
         obj_store.put(&tmp_file, &some_data).await.unwrap();
 
         let config = SchedulerConfig::default_for_testing();
@@ -1007,7 +1021,7 @@ mod tests {
         // Write 75MiB of data
         const DATA_SIZE: u64 = 75 * 1024 * 1024;
         let mut some_data = vec![0; DATA_SIZE as usize];
-        rand::thread_rng().fill_bytes(&mut some_data);
+        rand::rng().fill_bytes(&mut some_data);
         obj_store.put(&tmp_file, &some_data).await.unwrap();
 
         let config = SchedulerConfig::default_for_testing();
@@ -1115,6 +1129,7 @@ mod tests {
             false,
             1,
             DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
         ));
 
         let config = SchedulerConfig {
@@ -1204,6 +1219,7 @@ mod tests {
             false,
             1,
             DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
         ));
 
         let config = SchedulerConfig {

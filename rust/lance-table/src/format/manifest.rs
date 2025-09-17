@@ -17,7 +17,7 @@ use prost::Message;
 use prost_types::Timestamp;
 
 use super::Fragment;
-use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_MOVE_STABLE_ROW_IDS};
+use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_STABLE_ROW_IDS};
 use crate::format::pb;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{Schema, StorageClass};
@@ -70,8 +70,9 @@ pub struct Manifest {
     /// The writer flags
     pub writer_feature_flags: u64,
 
-    /// The max fragment id used so far
-    pub max_fragment_id: u32,
+    /// The max fragment id used so far  
+    /// None means never set, Some(0) means max ID used so far is 0
+    pub max_fragment_id: Option<u32>,
 
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
@@ -91,6 +92,9 @@ pub struct Manifest {
 
     /// Blob dataset version
     pub blob_dataset_version: Option<u64>,
+
+    /* external base paths */
+    pub base_paths: HashMap<u32, BasePath>,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -119,6 +123,7 @@ impl Manifest {
         fragments: Arc<Vec<Fragment>>,
         data_storage_format: DataStorageFormat,
         blob_dataset_version: Option<u64>,
+        base_paths: HashMap<u32, BasePath>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
         let local_schema = schema.retain_storage_class(StorageClass::Default);
@@ -135,13 +140,14 @@ impl Manifest {
             tag: None,
             reader_feature_flags: 0,
             writer_feature_flags: 0,
-            max_fragment_id: 0,
+            max_fragment_id: None,
             transaction_file: None,
             fragment_offsets,
             next_row_id: 0,
             data_storage_format,
             config: HashMap::new(),
             blob_dataset_version,
+            base_paths,
         }
     }
 
@@ -175,6 +181,71 @@ impl Manifest {
             data_storage_format: previous.data_storage_format.clone(),
             config: previous.config.clone(),
             blob_dataset_version,
+            base_paths: previous.base_paths.clone(),
+        }
+    }
+
+    /// Performs a shallow_clone of the manifest entirely in memory without:
+    /// - Any persistent storage operations
+    /// - Modifications to the original data
+    pub fn shallow_clone(
+        &self,
+        ref_name: Option<String>,
+        ref_path: String,
+        ref_base_id: u32,
+        transaction_file: String,
+    ) -> Self {
+        let cloned_fragments = self
+            .fragments
+            .as_ref()
+            .iter()
+            .map(|fragment| {
+                let mut cloned_fragment = fragment.clone();
+                for file in &mut cloned_fragment.files {
+                    if file.base_id.is_none() {
+                        file.base_id = Some(ref_base_id);
+                    }
+                }
+
+                if let Some(deletion) = &mut cloned_fragment.deletion_file {
+                    if deletion.base_id.is_none() {
+                        deletion.base_id = Some(ref_base_id);
+                    }
+                }
+                cloned_fragment
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            schema: self.schema.clone(),
+            local_schema: self.local_schema.clone(),
+            version: self.version,
+            writer_version: self.writer_version.clone(),
+            fragments: Arc::new(cloned_fragments),
+            version_aux_data: self.version_aux_data,
+            index_section: None, // These will be set on commit
+            timestamp_nanos: self.timestamp_nanos,
+            tag: None,
+            reader_feature_flags: 0, // These will be set on commit
+            writer_feature_flags: 0, // These will be set on commit
+            max_fragment_id: self.max_fragment_id,
+            transaction_file: Some(transaction_file),
+            fragment_offsets: self.fragment_offsets.clone(),
+            next_row_id: self.next_row_id,
+            data_storage_format: self.data_storage_format.clone(),
+            config: self.config.clone(),
+            blob_dataset_version: self.blob_dataset_version,
+            base_paths: {
+                let mut base_paths = self.base_paths.clone();
+                let base_path = BasePath {
+                    id: ref_base_id,
+                    name: ref_name,
+                    is_dataset_root: true,
+                    path: ref_path,
+                };
+                base_paths.insert(ref_base_id, base_path);
+                base_paths
+            },
         }
     }
 
@@ -206,46 +277,74 @@ impl Manifest {
     }
 
     /// Replaces the schema metadata with the given key-value pairs.
-    pub fn update_schema_metadata(&mut self, new_metadata: HashMap<String, String>) {
+    pub fn replace_schema_metadata(&mut self, new_metadata: HashMap<String, String>) {
         self.schema.metadata = new_metadata;
     }
 
     /// Replaces the metadata of the field with the given id with the given key-value pairs.
     ///
     /// If the field does not exist in the schema, this is a no-op.
-    pub fn update_field_metadata(&mut self, field_id: i32, new_metadata: HashMap<String, String>) {
+    pub fn replace_field_metadata(
+        &mut self,
+        field_id: i32,
+        new_metadata: HashMap<String, String>,
+    ) -> Result<()> {
         if let Some(field) = self.schema.field_by_id_mut(field_id) {
             field.metadata = new_metadata;
+            Ok(())
+        } else {
+            Err(Error::invalid_input(
+                format!(
+                    "Field with id {} does not exist for replace_field_metadata",
+                    field_id
+                ),
+                location!(),
+            ))
         }
     }
 
     /// Check the current fragment list and update the high water mark
     pub fn update_max_fragment_id(&mut self) {
+        // If there are no fragments, don't update max_fragment_id
+        if self.fragments.is_empty() {
+            return;
+        }
+
         let max_fragment_id = self
             .fragments
             .iter()
             .map(|f| f.id)
             .max()
-            .unwrap_or_default()
+            .unwrap() // Safe because we checked fragments is not empty
             .try_into()
             .unwrap();
 
-        if max_fragment_id > self.max_fragment_id {
-            self.max_fragment_id = max_fragment_id;
+        match self.max_fragment_id {
+            None => {
+                // First time being set
+                self.max_fragment_id = Some(max_fragment_id);
+            }
+            Some(current_max) => {
+                // Only update if the computed max is greater than current
+                // This preserves the high water mark even when fragments are deleted
+                if max_fragment_id > current_max {
+                    self.max_fragment_id = Some(max_fragment_id);
+                }
+            }
         }
     }
 
     /// Return the max fragment id.
     /// Note this does not support recycling of fragment ids.
     ///
-    /// This will return None if there are no fragments.
+    /// This will return None if there are no fragments and max_fragment_id was never set.
     pub fn max_fragment_id(&self) -> Option<u64> {
-        if self.max_fragment_id == 0 {
-            // It might not have been updated, so the best we can do is recompute
-            // it from the fragment list.
-            self.fragments.iter().map(|f| f.id).max()
+        if let Some(max_id) = self.max_fragment_id {
+            // Return the stored high water mark
+            Some(max_id.into())
         } else {
-            Some(self.max_fragment_id.into())
+            // Not yet set, compute from fragment list
+            self.fragments.iter().map(|f| f.id).max()
         }
     }
 
@@ -323,9 +422,9 @@ impl Manifest {
         fragments
     }
 
-    /// Whether the dataset uses move-stable row ids.
-    pub fn uses_move_stable_row_ids(&self) -> bool {
-        self.reader_feature_flags & FLAG_MOVE_STABLE_ROW_IDS != 0
+    /// Whether the dataset uses stable row ids.
+    pub fn uses_stable_row_ids(&self) -> bool {
+        self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
     }
 
     /// Creates a serialized copy of the manifest, suitable for IPC or temp storage
@@ -338,6 +437,14 @@ impl Manifest {
     pub fn should_use_legacy_format(&self) -> bool {
         self.data_storage_format.version == LEGACY_FORMAT_VERSION
     }
+}
+
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub struct BasePath {
+    pub id: u32,
+    pub name: Option<String>,
+    pub is_dataset_root: bool,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -456,6 +563,17 @@ impl ProtoStruct for Manifest {
     type Proto = pb::Manifest;
 }
 
+impl From<pb::BasePath> for BasePath {
+    fn from(p: pb::BasePath) -> Self {
+        Self {
+            id: p.id,
+            name: p.name,
+            is_dataset_root: p.is_dataset_root,
+            path: p.path,
+        }
+    }
+}
+
 impl TryFrom<pb::Manifest> for Manifest {
     type Error = Error;
 
@@ -484,7 +602,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             metadata: p.metadata,
         };
 
-        if FLAG_MOVE_STABLE_ROW_IDS & p.reader_feature_flags != 0
+        if FLAG_STABLE_ROW_IDS & p.reader_feature_flags != 0
             && !fragments.iter().all(|frag| frag.row_id_meta.is_some())
         {
             return Err(Error::Internal {
@@ -518,7 +636,6 @@ impl TryFrom<pb::Manifest> for Manifest {
             local_schema,
             version: p.version,
             writer_version,
-            fragments,
             version_aux_data: p.version_aux_data as usize,
             index_section: p.index_section.map(|i| i as usize),
             timestamp_nanos: timestamp_nanos.unwrap_or(0),
@@ -526,6 +643,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             reader_feature_flags: p.reader_feature_flags,
             writer_feature_flags: p.writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
+            fragments,
             transaction_file: if p.transaction_file.is_empty() {
                 None
             } else {
@@ -540,6 +658,11 @@ impl TryFrom<pb::Manifest> for Manifest {
             } else {
                 Some(p.blob_dataset_version)
             },
+            base_paths: p
+                .base_paths
+                .iter()
+                .map(|item| (item.id, item.clone().into()))
+                .collect(),
         })
     }
 }
@@ -584,6 +707,16 @@ impl From<&Manifest> for pb::Manifest {
             }),
             config: m.config.clone(),
             blob_dataset_version: m.blob_dataset_version.unwrap_or_default(),
+            base_paths: m
+                .base_paths
+                .values()
+                .map(|base_path| pb::BasePath {
+                    id: base_path.id,
+                    name: base_path.name.clone(),
+                    is_dataset_root: base_path.is_dataset_root,
+                    path: base_path.path.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -704,6 +837,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
+            HashMap::new(),
         );
 
         let actual = manifest.fragments_by_offset_range(0..10);
@@ -771,6 +905,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
+            HashMap::new(),
         );
 
         assert_eq!(manifest.max_field_id(), 43);
@@ -794,6 +929,7 @@ mod tests {
             Arc::new(fragments),
             DataStorageFormat::default(),
             /*blob_dataset_version= */ None,
+            HashMap::new(),
         );
 
         let mut config = manifest.config.clone();

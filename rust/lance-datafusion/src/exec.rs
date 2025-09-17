@@ -5,7 +5,9 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    fmt::{self, Formatter},
+    sync::{Arc, LazyLock, Mutex},
+    time::Duration,
 };
 
 use arrow_array::RecordBatch;
@@ -15,7 +17,7 @@ use datafusion::{
     dataframe::DataFrame,
     execution::{
         context::{SessionConfig, SessionContext},
-        disk_manager::DiskManagerConfig,
+        disk_manager::DiskManagerBuilder,
         memory_pool::FairSpillPool,
         runtime_env::RuntimeEnvBuilder,
         TaskContext,
@@ -23,7 +25,7 @@ use datafusion::{
     physical_plan::{
         analyze::AnalyzeExec,
         display::DisplayableExecutionPlan,
-        execution_plan::{Boundedness, EmissionType},
+        execution_plan::{Boundedness, CardinalityEffect, EmissionType},
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -31,23 +33,27 @@ use datafusion::{
 };
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
-use lazy_static::lazy_static;
 
 use futures::{stream, StreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::{
     utils::{
         futures::FinallyStreamExt,
-        tracing::{EXECUTION_PLAN_RUN, TRACE_EXECUTION},
+        tracing::{StreamTracingExt, EXECUTION_PLAN_RUN, TRACE_EXECUTION},
     },
     Error, Result,
 };
 use log::{debug, info, warn};
 use snafu::location;
+use tracing::Span;
 
-use crate::utils::{
-    MetricsExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
-    PARTS_LOADED_METRIC, REQUESTS_METRIC,
+use crate::udf::register_functions;
+use crate::{
+    chunker::StrictBatchSizeStream,
+    utils::{
+        MetricsExt, BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
+        IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+    },
 };
 
 /// An source execution node created from an existing stream
@@ -113,7 +119,8 @@ impl DisplayAs for OneShotExec {
             .schema
             .field_names()
             .iter()
-            .map(|s| s.to_string())
+            .cloned()
+            .cloned()
             .collect::<Vec<_>>();
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
@@ -155,9 +162,15 @@ impl ExecutionPlan for OneShotExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        // OneShotExec has no children, so this should only be called with an empty vector
+        if !children.is_empty() {
+            return Err(datafusion_common::DataFusionError::Internal(
+                "OneShotExec does not support children".to_string(),
+            ));
+        }
+        Ok(self)
     }
 
     fn execute(
@@ -185,6 +198,84 @@ impl ExecutionPlan for OneShotExec {
 
     fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
         &self.properties
+    }
+}
+
+struct TracedExec {
+    input: Arc<dyn ExecutionPlan>,
+    properties: PlanProperties,
+    span: Span,
+}
+
+impl TracedExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, span: Span) -> Self {
+        Self {
+            properties: input.properties().clone(),
+            input,
+            span,
+        }
+    }
+}
+
+impl DisplayAs for TracedExec {
+    fn fmt_as(
+        &self,
+        t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
+                write!(f, "TracedExec")
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for TracedExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "TracedExec")
+    }
+}
+impl ExecutionPlan for TracedExec {
+    fn name(&self) -> &str {
+        "TracedExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self {
+            input: children[0].clone(),
+            properties: self.properties.clone(),
+            span: self.span.clone(),
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let _guard = self.span.enter();
+        let stream = self.input.execute(partition, context)?;
+        let schema = stream.schema();
+        let stream = stream.stream_in_span(self.span.clone());
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
@@ -253,25 +344,28 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
     }
     if options.use_spilling() {
         runtime_env_builder = runtime_env_builder
-            .with_disk_manager(DiskManagerConfig::new())
+            .with_disk_manager_builder(DiskManagerBuilder::default())
             .with_memory_pool(Arc::new(FairSpillPool::new(
                 options.mem_pool_size() as usize
             )));
     }
     let runtime_env = runtime_env_builder.build_arc().unwrap();
-    SessionContext::new_with_config_rt(session_config, runtime_env)
+
+    let ctx = SessionContext::new_with_config_rt(session_config, runtime_env);
+    register_functions(&ctx);
+
+    ctx
 }
 
-lazy_static! {
-    static ref DEFAULT_SESSION_CONTEXT: SessionContext =
-        new_session_context(&LanceExecutionOptions::default());
-    static ref DEFAULT_SESSION_CONTEXT_WITH_SPILLING: SessionContext = {
-        new_session_context(&LanceExecutionOptions {
-            use_spilling: true,
-            ..Default::default()
-        })
-    };
-}
+static DEFAULT_SESSION_CONTEXT: LazyLock<SessionContext> =
+    LazyLock::new(|| new_session_context(&LanceExecutionOptions::default()));
+
+static DEFAULT_SESSION_CONTEXT_WITH_SPILLING: LazyLock<SessionContext> = LazyLock::new(|| {
+    new_session_context(&LanceExecutionOptions {
+        use_spilling: true,
+        ..Default::default()
+    })
+});
 
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
     if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE && options.target_partition.is_none()
@@ -351,7 +445,8 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
     visit_node(plan, &mut counts);
     tracing::info!(
         target: TRACE_EXECUTION,
-        type = EXECUTION_PLAN_RUN,
+        r#type = EXECUTION_PLAN_RUN,
+        plan_summary = display_plan_one_liner(plan),
         output_rows,
         iops = counts.iops,
         requests = counts.requests,
@@ -362,6 +457,38 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
     );
     if let Some(callback) = options.execution_stats_callback.as_ref() {
         callback(&counts);
+    }
+}
+
+/// Create a one-line rough summary of the given execution plan.
+///
+/// The summary just shows the name of the operators in the plan. It omits any
+/// details such as parameters or schema information.
+///
+/// Example: `Projection(Take(CoalesceBatches(Filter(LanceScan))))`
+fn display_plan_one_liner(plan: &dyn ExecutionPlan) -> String {
+    let mut output = String::new();
+
+    display_plan_one_liner_impl(plan, &mut output);
+
+    output
+}
+
+fn display_plan_one_liner_impl(plan: &dyn ExecutionPlan, output: &mut String) {
+    // Remove the "Exec" suffix from the plan name if present for brevity
+    let name = plan.name().trim_end_matches("Exec");
+    output.push_str(name);
+
+    let children = plan.children();
+    if !children.is_empty() {
+        output.push('(');
+        for (i, child) in children.iter().enumerate() {
+            if i > 0 {
+                output.push(',');
+            }
+            display_plan_one_liner_impl(child.as_ref(), output);
+        }
+        output.push(')');
     }
 }
 
@@ -395,6 +522,10 @@ pub async fn analyze_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<String> {
+    // This is needed as AnalyzeExec launches a thread task per
+    // partition, and we want these to be connected to the parent span
+    let plan = Arc::new(TracedExec::new(plan, Span::current()));
+
     let schema = plan.schema();
     let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
 
@@ -412,8 +543,94 @@ pub async fn analyze_plan(
     // fully execute the plan
     while (stream.next().await).is_some() {}
 
-    let display = DisplayableExecutionPlan::with_metrics(analyze.as_ref());
-    Ok(format!("{}", display.indent(true)))
+    let result = format_plan(analyze);
+    Ok(result)
+}
+
+pub fn format_plan(plan: Arc<dyn ExecutionPlan>) -> String {
+    /// A visitor which calculates additional metrics for all the plans.
+    struct CalculateVisitor {
+        highest_index: usize,
+        index_to_cumulative_cpu: HashMap<usize, usize>,
+    }
+    impl CalculateVisitor {
+        fn calculate_cumulative_cpu(&mut self, plan: &Arc<dyn ExecutionPlan>) -> usize {
+            self.highest_index += 1;
+            let plan_index = self.highest_index;
+            let elapsed_cpu: usize = match plan.metrics() {
+                Some(metrics) => metrics.elapsed_compute().unwrap_or_default(),
+                None => 0,
+            };
+            let mut cumulative_cpu = elapsed_cpu;
+            for child in plan.children() {
+                cumulative_cpu += self.calculate_cumulative_cpu(child);
+            }
+            self.index_to_cumulative_cpu
+                .insert(plan_index, cumulative_cpu);
+            cumulative_cpu
+        }
+    }
+
+    /// A visitor which prints out all the plans.
+    struct PrintVisitor {
+        highest_index: usize,
+        indent: usize,
+    }
+    impl PrintVisitor {
+        fn write_output(
+            &mut self,
+            plan: &Arc<dyn ExecutionPlan>,
+            f: &mut Formatter,
+            calcs: &CalculateVisitor,
+        ) -> std::fmt::Result {
+            self.highest_index += 1;
+            write!(f, "{:indent$}", "", indent = self.indent * 2)?;
+            plan.fmt_as(datafusion::physical_plan::DisplayFormatType::Verbose, f)?;
+            if let Some(metrics) = plan.metrics() {
+                let metrics = metrics
+                    .aggregate_by_name()
+                    .sorted_for_display()
+                    .timestamps_removed();
+
+                write!(f, ", metrics=[{metrics}]")?;
+            } else {
+                write!(f, ", metrics=[]")?;
+            }
+            let cumulative_cpu = calcs
+                .index_to_cumulative_cpu
+                .get(&self.highest_index)
+                .unwrap();
+            let cumulative_cpu_duration = Duration::from_nanos((*cumulative_cpu) as u64);
+            write!(f, ", cumulative_cpu={cumulative_cpu_duration:?}")?;
+            writeln!(f)?;
+            self.indent += 1;
+            for child in plan.children() {
+                self.write_output(child, f, calcs)?;
+            }
+            self.indent -= 1;
+            std::fmt::Result::Ok(())
+        }
+    }
+    // A wrapper which prints out a plan.
+    struct PrintWrapper {
+        plan: Arc<dyn ExecutionPlan>,
+    }
+    impl fmt::Display for PrintWrapper {
+        fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+            let mut calcs = CalculateVisitor {
+                highest_index: 0,
+                index_to_cumulative_cpu: HashMap::new(),
+            };
+            calcs.calculate_cumulative_cpu(&self.plan);
+            let mut prints = PrintVisitor {
+                highest_index: 0,
+                indent: 0,
+            };
+            prints.write_output(&self.plan, f, &calcs)
+        }
+    }
+    let wrapper = PrintWrapper { plan };
+    format!("{}", wrapper)
 }
 
 pub trait SessionContextExt {
@@ -473,5 +690,85 @@ impl SessionContextExt for SessionContext {
         let part_stream = Arc::new(OneShotPartitionStream::new(data));
         let provider = StreamingTable::try_new(schema, vec![part_stream])?;
         self.read_table(Arc::new(provider))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StrictBatchSizeExec {
+    input: Arc<dyn ExecutionPlan>,
+    batch_size: usize,
+}
+
+impl StrictBatchSizeExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, batch_size: usize) -> Self {
+        Self { input, batch_size }
+    }
+}
+
+impl DisplayAs for StrictBatchSizeExec {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "StrictBatchSizeExec")
+    }
+}
+
+impl ExecutionPlan for StrictBatchSizeExec {
+    fn name(&self) -> &str {
+        "StrictBatchSizeExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        self.input.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self {
+            input: children[0].clone(),
+            batch_size: self.batch_size,
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let stream = self.input.execute(partition, context)?;
+        let schema = stream.schema();
+        let stream = StrictBatchSizeStream::new(stream, self.batch_size);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion_common::Result<Statistics> {
+        self.input.partition_statistics(partition)
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
     }
 }

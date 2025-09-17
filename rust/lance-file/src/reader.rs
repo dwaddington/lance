@@ -22,7 +22,7 @@ use async_recursion::async_recursion;
 use deepsize::DeepSizeOf;
 use futures::{stream, Future, FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::*;
-use lance_core::cache::LanceCache;
+use lance_core::cache::{CacheKey, LanceCache};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
 use lance_io::encodings::dictionary::DictionaryDecoder;
@@ -33,6 +33,7 @@ use lance_io::utils::{
     read_fixed_stride_array, read_metadata_offset, read_struct, read_struct_from_buf,
 };
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
+use std::borrow::Cow;
 
 use object_store::path::Path;
 use snafu::location;
@@ -65,6 +66,29 @@ impl std::fmt::Debug for FileReader {
             .field("fragment", &self.fragment_id)
             .field("path", &self.object_reader.path())
             .finish()
+    }
+}
+
+// Generic cache key for string-based keys
+struct StringCacheKey<'a, T> {
+    key: &'a str,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<'a, T> StringCacheKey<'a, T> {
+    fn new(key: &'a str) -> Self {
+        Self {
+            key,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> CacheKey for StringCacheKey<'_, T> {
+    type ValueType = T;
+
+    fn key(&self) -> Cow<'_, str> {
+        self.key.into()
     }
 }
 
@@ -216,10 +240,13 @@ impl FileReader {
     ) -> Result<Arc<T>>
     where
         F: Fn(&str) -> Fut,
-        Fut: Future<Output = Result<T>>,
+        Fut: Future<Output = Result<T>> + Send,
     {
         if let Some(cache) = cache {
-            cache.get_or_insert(key, loader).await
+            let cache_key = StringCacheKey::<T>::new(key.as_str());
+            cache
+                .get_or_insert_with_key(cache_key, || loader(key.as_str()))
+                .await
         } else {
             Ok(Arc::new(loader(key.as_str()).await?))
         }
@@ -823,7 +850,10 @@ mod tests {
         .await
         .unwrap();
         for batch in batches.iter() {
-            file_writer.write(&[batch.clone()]).await.unwrap();
+            file_writer
+                .write(std::slice::from_ref(batch))
+                .await
+                .unwrap();
         }
         file_writer.finish().await.unwrap();
 
@@ -883,7 +913,10 @@ mod tests {
         )
         .await
         .unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
@@ -1280,7 +1313,10 @@ mod tests {
         )
         .await
         .unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         file_writer.finish().await.unwrap();
 
         // Make sure the big array was not written to the file
@@ -1447,7 +1483,10 @@ mod tests {
         let array = Int32Array::from(vec![0; 15]);
         let batch =
             RecordBatch::try_new(Arc::new(partial_arrow), vec![Arc::new(array.clone())]).unwrap();
-        file_writer.write(&[batch.clone()]).await.unwrap();
+        file_writer
+            .write(std::slice::from_ref(&batch))
+            .await
+            .unwrap();
         file_writer.finish().await.unwrap();
 
         let field_id = partial_schema.fields.first().unwrap().id;

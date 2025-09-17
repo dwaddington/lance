@@ -74,6 +74,9 @@ from .optimize import (
     RewriteResult as RewriteResult,
 )
 from .schema import LanceSchema as LanceSchema
+from .trace import TraceEvent as TraceEvent
+from .trace import capture_trace_events as capture_trace_events
+from .trace import shutdown_tracing as shutdown_tracing
 from .trace import trace_to_chrome as trace_to_chrome
 
 def infer_tfrecord_schema(
@@ -96,11 +99,29 @@ class LanceFileWriter:
         version: Optional[str],
         storage_options: Optional[Dict[str, str]],
         keep_original_array: Optional[bool],
+        max_page_bytes: Optional[int],
     ): ...
     def write_batch(self, batch: pa.RecordBatch) -> None: ...
     def finish(self) -> int: ...
     def add_schema_metadata(self, key: str, value: str) -> None: ...
     def add_global_buffer(self, data: bytes) -> int: ...
+
+class LanceFileSession:
+    def __init__(
+        self, base_path: str, storage_options: Optional[Dict[str, str]] = None
+    ): ...
+    def open_reader(
+        self, path: str, columns: Optional[List[str]] = None
+    ) -> LanceFileReader: ...
+    def open_writer(
+        self,
+        path: str,
+        schema: Optional[pa.Schema] = None,
+        data_cache_bytes: Optional[int] = None,
+        version: Optional[str] = None,
+        keep_original_array: Optional[bool] = None,
+        max_page_bytes: Optional[int] = None,
+    ) -> LanceFileWriter: ...
 
 class LanceFileReader:
     def __init__(
@@ -176,6 +197,8 @@ class _Dataset:
         commit_handler: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
         manifest: Optional[bytes] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
+        index_cache_size_bytes: Optional[int] = None,
         **kwargs,
     ): ...
     @property
@@ -276,6 +299,9 @@ class _Dataset:
     ): ...
     def drop_index(self, name: str): ...
     def prewarm_index(self, name: str): ...
+    def merge_index_metadata(
+        self, index_uuid: str, index_type: str, batch_readhead: Optional[int] = None
+    ): ...
     def count_fragments(self) -> int: ...
     def num_small_files(self, max_rows_per_group: int) -> int: ...
     def get_fragments(self) -> List[_Fragment]: ...
@@ -284,7 +310,11 @@ class _Dataset:
     def index_cache_hit_rate(self) -> float: ...
     def session(self) -> _Session: ...
     @staticmethod
-    def drop(dest: str, storage_options: Optional[Dict[str, str]] = None): ...
+    def drop(
+        dest: str,
+        storage_options: Optional[Dict[str, str]] = None,
+        ignore_not_found: Optional[bool] = None,
+    ): ...
     @staticmethod
     def commit(
         dest: str | _Dataset,
@@ -321,6 +351,10 @@ class _Dataset:
         batch_size: Optional[int] = None,
     ): ...
     def add_columns_with_schema(self, schema: pa.Schema): ...
+    def read_transaction(self, version: int) -> Optional[Transaction]: ...
+    def get_transactions(
+        self, recent_transactions=10
+    ) -> Optional[List[Transaction]]: ...
 
 class _MergeInsertBuilder:
     def __init__(self, dataset: _Dataset, on: str | Iterable[str]): ...
@@ -406,7 +440,7 @@ def _write_fragments(
     progress: Optional[FragmentWriteProgress],
     data_storage_version: Optional[str],
     storage_options: Optional[Dict[str, str]],
-    enable_move_stable_row_ids: bool,
+    enable_stable_row_ids: bool,
 ): ...
 def _write_fragments_transaction(
     dataset_uri: str | Path | _Dataset,
@@ -418,7 +452,7 @@ def _write_fragments_transaction(
     progress: Optional[FragmentWriteProgress],
     data_storage_version: Optional[str],
     storage_options: Optional[Dict[str, str]],
-    enable_move_stable_row_ids: bool,
+    enable_stable_row_ids: bool,
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...
 def _schema_to_json(schema: pa.Schema) -> str: ...

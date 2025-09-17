@@ -16,6 +16,7 @@ use lance_core::{
     Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_io::ReadBatchParams;
+use tracing::{instrument, Instrument};
 
 use crate::rowids::RowIdSequence;
 
@@ -123,10 +124,9 @@ fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<R
     // and thus not deleted.
     let mask_buffer = NullBuffer::new(mask.values().clone());
 
-    match mask_buffer.null_count() {
+    if mask_buffer.null_count() == 0 {
         // No rows are deleted
-        0 => return Ok(batch),
-        _ => {}
+        return Ok(batch);
     }
 
     // For each column convert to data
@@ -161,6 +161,7 @@ fn apply_deletions_as_nulls(batch: RecordBatch, mask: &BooleanArray) -> Result<R
 }
 
 /// Configuration needed to apply row ids and deletions to a batch
+#[derive(Debug)]
 pub struct RowIdAndDeletesConfig {
     /// The row ids that were requested
     pub params: ReadBatchParams,
@@ -180,6 +181,7 @@ pub struct RowIdAndDeletesConfig {
     pub total_num_rows: u32,
 }
 
+#[instrument(level = "debug", skip_all)]
 pub fn apply_row_id_and_deletes(
     batch: RecordBatch,
     batch_offset: u32,
@@ -205,29 +207,41 @@ pub fn apply_row_id_and_deletes(
 
     let num_rows = batch.num_rows() as u32;
 
-    let row_addrs = if should_fetch_row_addr {
-        let row_offsets_in_batch = &config
-            .params
-            .slice(batch_offset as usize, num_rows as usize)
-            .unwrap()
-            .to_offsets()
-            .unwrap();
-        let row_addrs: UInt64Array = row_offsets_in_batch
-            .values()
-            .iter()
-            .map(|row_offset| u64::from(RowAddress::new_from_parts(fragment_id, *row_offset)))
-            .collect();
+    let row_addrs =
+        if should_fetch_row_addr {
+            let _rowaddrs = tracing::span!(tracing::Level::DEBUG, "fetch_row_addrs").entered();
+            let mut row_addrs = Vec::with_capacity(num_rows as usize);
+            for offset_range in config
+                .params
+                .slice(batch_offset as usize, num_rows as usize)
+                .unwrap()
+                .iter_offset_ranges()?
+            {
+                row_addrs.extend(offset_range.map(|row_offset| {
+                    u64::from(RowAddress::new_from_parts(fragment_id, row_offset))
+                }));
+            }
 
-        Some(Arc::new(row_addrs))
-    } else {
-        None
-    };
+            Some(Arc::new(UInt64Array::from(row_addrs)))
+        } else {
+            None
+        };
 
     let row_ids = if config.with_row_id {
+        let _rowids = tracing::span!(tracing::Level::DEBUG, "fetch_row_ids").entered();
         if let Some(row_id_sequence) = &config.row_id_sequence {
-            let row_ids = row_id_sequence
+            let selection = config
+                .params
                 .slice(batch_offset as usize, num_rows as usize)
-                .iter()
+                .unwrap()
+                .to_ranges()
+                .unwrap();
+            let row_ids = row_id_sequence
+                .select(
+                    selection
+                        .iter()
+                        .flat_map(|r| r.start as usize..r.end as usize),
+                )
                 .collect::<UInt64Array>();
             Some(Arc::new(row_ids))
         } else {
@@ -286,10 +300,14 @@ pub fn wrap_with_row_id_and_delete(
             let num_rows = batch_task.num_rows;
             offset += num_rows;
             let task = batch_task.task;
-            async move {
-                let batch = task.await?;
-                apply_row_id_and_deletes(batch, this_offset, fragment_id, config.as_ref())
-            }
+            tokio::spawn(
+                async move {
+                    let batch = task.await?;
+                    apply_row_id_and_deletes(batch, this_offset, fragment_id, config.as_ref())
+                }
+                .in_current_span(),
+            )
+            .map(|join_wrapper| join_wrapper.unwrap())
             .boxed()
         })
         .boxed()
@@ -329,13 +347,13 @@ mod tests {
     #[tokio::test]
     async fn test_basic_zip() {
         let left = batch_task_stream(
-            lance_datagen::gen()
+            lance_datagen::gen_batch()
                 .col("x", lance_datagen::array::step::<Int32Type>())
                 .into_reader_stream(RowCount::from(100), BatchCount::from(10))
                 .0,
         );
         let right = batch_task_stream(
-            lance_datagen::gen()
+            lance_datagen::gen_batch()
                 .col("y", lance_datagen::array::step::<Int32Type>())
                 .into_reader_stream(RowCount::from(100), BatchCount::from(10))
                 .0,
@@ -348,7 +366,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = lance_datagen::gen()
+        let expected = lance_datagen::gen_batch()
             .col("x", lance_datagen::array::step::<Int32Type>())
             .col("y", lance_datagen::array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(100), BatchCount::from(10))
@@ -363,7 +381,7 @@ mod tests {
         for has_columns in [false, true] {
             for fragment_id in [0, 10] {
                 // 100 rows across 10 batches of 10 rows
-                let mut datagen = lance_datagen::gen();
+                let mut datagen = lance_datagen::gen_batch();
                 if has_columns {
                     datagen = datagen.col("x", lance_datagen::array::rand::<Int32Type>());
                 }
@@ -457,7 +475,7 @@ mod tests {
                                 continue;
                             }
 
-                            let mut datagen = lance_datagen::gen();
+                            let mut datagen = lance_datagen::gen_batch();
                             if has_columns {
                                 datagen =
                                     datagen.col("x", lance_datagen::array::rand::<Int32Type>());

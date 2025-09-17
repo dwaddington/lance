@@ -20,14 +20,20 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
-use lance_arrow::{bfloat16::ARROW_EXT_NAME_KEY, *};
+use lance_arrow::{
+    json::{is_arrow_json_field, is_json_field},
+    ARROW_EXT_NAME_KEY, *,
+};
 use snafu::location;
 
 use super::{
     schema::{compare_fields, explain_fields_difference},
     Dictionary, LogicalType, Projection,
 };
-use crate::{Error, Result};
+use crate::{
+    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_META_KEY},
+    Error, Result,
+};
 
 pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-class";
 
@@ -60,11 +66,11 @@ pub struct SchemaCompareOptions {
     pub compare_field_ids: bool,
     /// Should nullability be compared (default Strict)
     pub compare_nullability: NullabilityComparison,
-    /// Allow fields in the expected schema to be missing from the schema being tested if  
-    /// they are nullable (default false)  
-    ///  
-    /// Fields in the schema being tested must always be present in the expected schema  
-    /// regardless of this flag.  
+    /// Allow fields in the expected schema to be missing from the schema being tested if
+    /// they are nullable (default false)
+    ///
+    /// Fields in the schema being tested must always be present in the expected schema
+    /// regardless of this flag.
     pub allow_missing_if_nullable: bool,
     /// Allow out of order fields (default false)
     pub ignore_field_order: bool,
@@ -271,10 +277,9 @@ impl Field {
         if children.is_empty() && !projection.contains_field_id(self.id) {
             None
         } else {
-            Some(Self {
-                children,
-                ..self.clone()
-            })
+            let mut new_field = self.clone();
+            new_field.children = children;
+            Some(projection.blob_handling.unload_if_needed(new_field))
         }
     }
 
@@ -492,6 +497,25 @@ impl Field {
                 .find(|c| c.name == first)
                 .and_then(|c| c.sub_field_mut(&path_components[1..]))
         }
+    }
+
+    /// Check if the user has labeled the field as a blob
+    ///
+    /// Blob fields will load descriptions by default
+    pub fn is_blob(&self) -> bool {
+        self.metadata.contains_key(BLOB_META_KEY)
+    }
+
+    /// If the field is a blob, return a new field with the same name and id
+    /// but with the data type set to a struct of the blob description fields.
+    ///
+    /// If the field is not a blob, return the field itself.
+    pub fn into_unloaded(mut self) -> Self {
+        if self.data_type().is_binary_like() && self.is_blob() {
+            self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
+            self.children = BLOB_DESC_LANCE_FIELD.children.clone();
+        }
+        self
     }
 
     pub fn project(&self, path_components: &[&str]) -> Result<Self> {
@@ -967,11 +991,18 @@ impl TryFrom<&ArrowField> for Field {
             .map(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
             .unwrap_or(false);
 
+        // Check for JSON extension types (both Arrow and Lance)
+        let logical_type = if is_arrow_json_field(field) || is_json_field(field) {
+            LogicalType::from("json")
+        } else {
+            LogicalType::try_from(field.data_type())?
+        };
+
         Ok(Self {
             id: -1,
             parent_id: -1,
             name: field.name().clone(),
-            logical_type: LogicalType::try_from(field.data_type())?,
+            logical_type,
             encoding: match field.data_type() {
                 dt if dt.is_fixed_stride() => Some(Encoding::Plain),
                 dt if dt.is_binary_like() => Some(Encoding::VarBinary),
@@ -1002,6 +1033,15 @@ impl From<&Field> for ArrowField {
     fn from(field: &Field) -> Self {
         let out = Self::new(&field.name, field.data_type(), field.nullable);
         let mut metadata = field.metadata.clone();
+
+        // Add JSON extension metadata if this is a JSON field
+        if field.logical_type.0 == "json" {
+            metadata.insert(
+                ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::json::JSON_EXT_NAME.to_string(),
+            );
+        }
+
         match field.storage_class {
             StorageClass::Default => {}
             StorageClass::Blob => {
@@ -1011,7 +1051,7 @@ impl From<&Field> for ArrowField {
                 );
             }
         }
-        out.with_metadata(field.metadata.clone())
+        out.with_metadata(metadata)
     }
 }
 

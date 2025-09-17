@@ -6,13 +6,15 @@ use std::sync::Arc;
 use std::{
     cmp::{min, Reverse},
     collections::BinaryHeap,
-    ops::RangeInclusive,
 };
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
 };
 
+use crate::metrics::NoOpMetricsCollector;
+use crate::prefilter::NoFilter;
+use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use arrow::{
     array::LargeBinaryBuilder,
     datatypes::{self, Float32Type, Int32Type, UInt64Type},
@@ -33,19 +35,20 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
 use fst::{Automaton, IntoStreamer, Streamer};
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
+use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::{
     mask::RowIdMask,
     tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS},
 };
 use lance_core::{container::list::ExpLinkedList, utils::tokio::get_num_compute_intensive_cpus};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
-use lazy_static::lazy_static;
-use moka::future::Cache;
 use roaring::RoaringBitmap;
 use snafu::location;
+use std::sync::LazyLock;
 use tracing::{info, instrument};
 
 use super::{
@@ -69,10 +72,13 @@ use super::{
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
 use crate::frag_reuse::FragReuseIndex;
 use crate::scalar::{
-    AnyQuery, IndexReader, IndexStore, MetricsCollector, SargableQuery, ScalarIndex, SearchResult,
+    AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
+    ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
 };
-use crate::Index;
+use crate::{pb, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
+
+pub const INVERTED_INDEX_VERSION: u32 = 0;
 
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
@@ -90,18 +96,12 @@ pub const LENGTH_COL: &str = "_length";
 pub const BLOCK_MAX_SCORE_COL: &str = "_block_max_score";
 pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
-lazy_static! {
-    pub static ref SCORE_FIELD: Field = Field::new(SCORE_COL, DataType::Float32, true);
-    pub static ref FTS_SCHEMA: SchemaRef =
-        Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()]));
-}
-
-lazy_static! {
-    pub static ref CACHE_SIZE: usize = std::env::var("LANCE_INVERTED_CACHE_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(512 * 1024 * 1024);
-}
+pub static SCORE_FIELD: LazyLock<Field> =
+    LazyLock::new(|| Field::new(SCORE_COL, DataType::Float32, true));
+pub static FTS_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()])));
+static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
 #[derive(Clone)]
 pub struct InvertedIndex {
@@ -128,14 +128,32 @@ impl DeepSizeOf for InvertedIndex {
 
 impl InvertedIndex {
     fn to_builder(&self) -> InvertedIndexBuilder {
+        self.to_builder_with_offset(None)
+    }
+
+    fn to_builder_with_offset(&self, fragment_mask: Option<u64>) -> InvertedIndexBuilder {
         if self.is_legacy() {
             // for legacy format, we re-create the index in the new format
-            InvertedIndexBuilder::new(self.params.clone())
+            InvertedIndexBuilder::new_with_fragment_mask(self.params.clone(), fragment_mask)
         } else {
+            let partitions = match fragment_mask {
+                Some(fragment_mask) => self
+                    .partitions
+                    .iter()
+                    // Filter partitions that belong to the specified fragment
+                    // The mask contains fragment_id in high 32 bits, we check if partition's
+                    // fragment_id matches by comparing the masked result with the original mask
+                    .filter(|part| part.belongs_to_fragment(fragment_mask))
+                    .map(|part| part.id())
+                    .collect(),
+                None => self.partitions.iter().map(|part| part.id()).collect(),
+            };
+
             InvertedIndexBuilder::from_existing_index(
                 self.params.clone(),
                 Some(self.store.clone()),
-                self.partitions.iter().map(|part| part.id).collect(),
+                partitions,
+                fragment_mask,
             )
         }
     }
@@ -167,6 +185,7 @@ impl InvertedIndex {
             return Ok((Vec::new(), Vec::new()));
         }
         let mask = prefilter.mask();
+
         let mut candidates = BinaryHeap::new();
         let parts = self
             .partitions
@@ -192,10 +211,15 @@ impl InvertedIndex {
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
         let scorer = BM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
         while let Some(res) = parts.try_next().await? {
-            for (row_id, freq, length) in res? {
+            for DocCandidate {
+                row_id,
+                freqs,
+                doc_length,
+            } in res?
+            {
                 let mut score = 0.0;
-                for token in tokens.iter() {
-                    score += scorer.score(token, freq, length);
+                for (token, freq) in freqs.into_iter() {
+                    score += scorer.score(token.as_str(), freq, doc_length);
                 }
                 if candidates.len() < limit {
                     candidates.push(Reverse(ScoredDoc::new(row_id, score)));
@@ -215,7 +239,8 @@ impl InvertedIndex {
 
     async fn load_legacy_index(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         log::warn!("loading legacy FTS index");
         let tokens_fut = tokio::spawn({
@@ -235,9 +260,11 @@ impl InvertedIndex {
         });
         let invert_list_fut = tokio::spawn({
             let store = store.clone();
+            let index_cache_clone = index_cache.clone();
             async move {
                 let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
-                let invert_list = PostingListReader::try_new(invert_list_reader).await?;
+                let invert_list =
+                    PostingListReader::try_new(invert_list_reader, &index_cache_clone).await?;
                 Result::Ok(Arc::new(invert_list))
             }
         });
@@ -245,7 +272,7 @@ impl InvertedIndex {
             let store = store.clone();
             async move {
                 let docs_reader = store.open_index_file(DOCS_FILE).await?;
-                let docs = DocSet::load(docs_reader, true, fri).await?;
+                let docs = DocSet::load(docs_reader, true, frag_reuse_index).await?;
                 Result::Ok(docs)
             }
         });
@@ -266,12 +293,80 @@ impl InvertedIndex {
                 tokens,
                 inverted_list,
                 docs,
+                fragments: Default::default(),
             })],
         }))
     }
 
     pub fn is_legacy(&self) -> bool {
         self.partitions.len() == 1 && self.partitions[0].is_legacy()
+    }
+
+    pub async fn load(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>>
+    where
+        Self: Sized,
+    {
+        // for new index format, there is a metadata file and multiple partitions,
+        // each partition is a separate index containing tokens, inverted list and docs.
+        // for old index format, there is no metadata file, and it's just like a single partition
+
+        match store.open_index_file(METADATA_FILE).await {
+            Ok(reader) => {
+                let params = reader.schema().metadata.get("params").ok_or(Error::Index {
+                    message: "params not found in metadata".to_owned(),
+                    location: location!(),
+                })?;
+                let params = serde_json::from_str::<InvertedIndexParams>(params)?;
+                let partitions =
+                    reader
+                        .schema()
+                        .metadata
+                        .get("partitions")
+                        .ok_or(Error::Index {
+                            message: "partitions not found in metadata".to_owned(),
+                            location: location!(),
+                        })?;
+                let partitions: Vec<u64> = serde_json::from_str(partitions)?;
+
+                let partitions = partitions.into_iter().map(|id| {
+                    let store = store.clone();
+                    let frag_reuse_index_clone = frag_reuse_index.clone();
+                    let index_cache_for_part =
+                        index_cache.with_key_prefix(format!("part-{}", id).as_str());
+                    async move {
+                        Result::Ok(Arc::new(
+                            InvertedPartition::load(
+                                store,
+                                id,
+                                frag_reuse_index_clone,
+                                &index_cache_for_part,
+                            )
+                            .await?,
+                        ))
+                    }
+                });
+                let partitions = stream::iter(partitions)
+                    .buffer_unordered(store.io_parallelism())
+                    .try_collect::<Vec<_>>()
+                    .await?;
+
+                let tokenizer = params.build()?;
+                Ok(Arc::new(Self {
+                    params,
+                    store,
+                    tokenizer,
+                    partitions,
+                }))
+            }
+            Err(_) => {
+                // old index format
+                Self::load_legacy_index(store, frag_reuse_index, index_cache).await
+            }
+        }
     }
 }
 
@@ -326,6 +421,31 @@ impl Index for InvertedIndex {
     }
 }
 
+impl InvertedIndex {
+    /// Search docs match the input text.
+    async fn do_search(&self, text: &str) -> Result<RecordBatch> {
+        let params = FtsSearchParams::new();
+        let mut tokenizer = self.tokenizer.clone();
+        let tokens = collect_tokens(text, &mut tokenizer, None);
+
+        let (doc_ids, _) = self
+            .bm25_search(
+                tokens.into(),
+                params.into(),
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+            )
+            .boxed()
+            .await?;
+
+        Ok(RecordBatch::try_new(
+            ROW_ID_SCHEMA.clone(),
+            vec![Arc::new(UInt64Array::from(doc_ids))],
+        )?)
+    }
+}
+
 #[async_trait]
 impl ScalarIndex for InvertedIndex {
     // return the row ids of the documents that contain the query
@@ -335,101 +455,108 @@ impl ScalarIndex for InvertedIndex {
         query: &dyn AnyQuery,
         _metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        return Err(Error::invalid_input(
-            format!("unsupported query {:?} for inverted index", query),
-            location!(),
-        ));
-    }
+        let query = query.as_any().downcast_ref::<TokenQuery>().unwrap();
 
-    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
-        true
-    }
-
-    async fn load(store: Arc<dyn IndexStore>, fri: Option<Arc<FragReuseIndex>>) -> Result<Arc<Self>>
-    where
-        Self: Sized,
-    {
-        // for new index format, there is a metadata file and multiple partitions,
-        // each partition is a separate index containing tokens, inverted list and docs.
-        // for old index format, there is no metadata file, and it's just like a single partition
-
-        match store.open_index_file(METADATA_FILE).await {
-            Ok(reader) => {
-                let params = reader.schema().metadata.get("params").ok_or(Error::Index {
-                    message: "params not found in metadata".to_owned(),
-                    location: location!(),
-                })?;
-                let params = serde_json::from_str::<InvertedIndexParams>(params)?;
-                let partitions =
-                    reader
-                        .schema()
-                        .metadata
-                        .get("partitions")
-                        .ok_or(Error::Index {
-                            message: "partitions not found in metadata".to_owned(),
-                            location: location!(),
-                        })?;
-                let partitions: Vec<u64> = serde_json::from_str(partitions)?;
-
-                let partitions = partitions.into_iter().map(|id| {
-                    let store = store.clone();
-                    let fri_clone = fri.clone();
-                    async move {
-                        Result::Ok(Arc::new(
-                            InvertedPartition::load(store, id, fri_clone).await?,
-                        ))
-                    }
-                });
-                let partitions = stream::iter(partitions)
-                    .buffer_unordered(store.io_parallelism())
-                    .try_collect::<Vec<_>>()
-                    .await?;
-                let tokenizer = params.build()?;
-                Ok(Arc::new(Self {
-                    params,
-                    store,
-                    tokenizer,
-                    partitions,
-                }))
-            }
-            Err(_) => {
-                // old index format
-                Self::load_legacy_index(store, fri).await
+        match query {
+            TokenQuery::TokensContains(text) => {
+                let records = self.do_search(text).await?;
+                let row_ids = records
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                let row_ids = row_ids.iter().flatten().collect_vec();
+                Ok(SearchResult::AtMost(RowIdTreeMap::from_iter(row_ids)))
             }
         }
+    }
+
+    fn can_remap(&self) -> bool {
+        true
     }
 
     async fn remap(
         &self,
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<CreatedIndex> {
         self.to_builder()
             .remap(mapping, self.store.clone(), dest_store)
-            .await
+            .await?;
+
+        let details = pb::InvertedIndexDetails::try_from(&self.params)?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&details).unwrap(),
+            index_version: INVERTED_INDEX_VERSION,
+        })
     }
 
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-    ) -> Result<()> {
-        self.to_builder().update(new_data, dest_store).await
+    ) -> Result<CreatedIndex> {
+        self.to_builder().update(new_data, dest_store).await?;
+
+        let details = pb::InvertedIndexDetails::try_from(&self.params)?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&details).unwrap(),
+            index_version: INVERTED_INDEX_VERSION,
+        })
+    }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        let criteria = TrainingCriteria::new(TrainingOrdering::None).with_row_id();
+        if self.is_legacy() {
+            UpdateCriteria::requires_old_data(criteria)
+        } else {
+            UpdateCriteria::only_new_data(criteria)
+        }
+    }
+
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        let mut params = self.params.clone();
+        if params.base_tokenizer.is_empty() {
+            params.base_tokenizer = "simple".to_string();
+        }
+
+        let params_json = serde_json::to_string(&params)?;
+
+        Ok(ScalarIndexParams {
+            index_type: BuiltinIndexType::Inverted.as_str().to_string(),
+            params: Some(params_json),
+        })
     }
 }
 
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct InvertedPartition {
-    // None for legacy format
+    // 0 for legacy format
     id: u64,
     store: Arc<dyn IndexStore>,
     pub(crate) tokens: TokenSet,
     pub(crate) inverted_list: Arc<PostingListReader>,
     pub(crate) docs: DocSet,
+    pub(crate) fragments: HashSet<u32>,
 }
 
 impl InvertedPartition {
+    /// Check if this partition belongs to the specified fragment.
+    ///
+    /// This method encapsulates the bit manipulation logic for fragment filtering
+    /// in distributed indexing scenarios.
+    ///
+    /// # Arguments
+    /// * `fragment_mask` - A mask with fragment_id in high 32 bits
+    ///
+    /// # Returns
+    /// * `true` if the partition belongs to the fragment, `false` otherwise
+    pub fn belongs_to_fragment(&self, fragment_mask: u64) -> bool {
+        (self.id() & fragment_mask) == fragment_mask
+    }
+
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -445,14 +572,16 @@ impl InvertedPartition {
     pub async fn load(
         store: Arc<dyn IndexStore>,
         id: u64,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        index_cache: &LanceCache,
     ) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
-        let inverted_list = PostingListReader::try_new(invert_list_file).await?;
+        let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
-        let docs = DocSet::load(docs_file, false, fri).await?;
+        let docs = DocSet::load(docs_file, false, frag_reuse_index).await?;
+        let fragments = docs.fragment_ids();
 
         Ok(Self {
             id,
@@ -460,6 +589,7 @@ impl InvertedPartition {
             tokens,
             inverted_list: Arc::new(inverted_list),
             docs,
+            fragments,
         })
     }
 
@@ -514,7 +644,7 @@ impl InvertedPartition {
         operator: Operator,
         mask: Arc<RowIdMask>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<(u64, u32, u32)>> {
+    ) -> Result<Vec<DocCandidate>> {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let is_phrase_query = params.phrase_slop.is_some();
         let tokens = match is_fuzzy {
@@ -566,7 +696,7 @@ impl InvertedPartition {
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {
-        let mut builder = InnerBuilder::new(self.id);
+        let mut builder = InnerBuilder::new(self.id, self.inverted_list.has_positions());
         builder.tokens = self.tokens;
         builder.docs = self.docs;
 
@@ -662,7 +792,7 @@ impl TokenSet {
         self.len() == 0
     }
 
-    pub(crate) fn iter(&self) -> TokenIterator {
+    pub(crate) fn iter(&self) -> TokenIterator<'_> {
         TokenIterator::new(match &self.tokens {
             TokenMap::HashMap(map) => TokenSource::HashMap(map.iter()),
             TokenMap::Fst(map) => TokenSource::Fst(map.stream()),
@@ -762,6 +892,38 @@ impl TokenSet {
         }
     }
 
+    // the `removed_token_ids` must be sorted
+    pub fn remap(&mut self, removed_token_ids: &[u32]) {
+        if removed_token_ids.is_empty() {
+            return;
+        }
+
+        let mut map = match std::mem::take(&mut self.tokens) {
+            TokenMap::HashMap(map) => map,
+            TokenMap::Fst(map) => {
+                let mut new_map = HashMap::with_capacity(map.len());
+                let mut stream = map.into_stream();
+                while let Some((token, token_id)) = stream.next() {
+                    new_map.insert(String::from_utf8_lossy(token).into_owned(), token_id as u32);
+                }
+
+                new_map
+            }
+        };
+
+        map.retain(
+            |_, token_id| match removed_token_ids.binary_search(token_id) {
+                Ok(_) => false,
+                Err(index) => {
+                    *token_id -= index as u32;
+                    true
+                }
+            },
+        );
+
+        self.tokens = TokenMap::HashMap(map);
+    }
+
     pub fn next_id(&self) -> u32 {
         self.next_id
     }
@@ -782,9 +944,7 @@ pub struct PostingListReader {
 
     has_position: bool,
 
-    // cache
-    posting_cache: Cache<u32, PostingList>,
-    position_cache: Cache<u32, ListArray>,
+    index_cache: WeakLanceCache,
 }
 
 impl std::fmt::Debug for PostingListReader {
@@ -801,13 +961,14 @@ impl DeepSizeOf for PostingListReader {
         self.offsets.deep_size_of_children(context)
             + self.max_scores.deep_size_of_children(context)
             + self.lengths.deep_size_of_children(context)
-            + self.posting_cache.weighted_size() as usize
-            + self.position_cache.weighted_size() as usize
     }
 }
 
 impl PostingListReader {
-    pub(crate) async fn try_new(reader: Arc<dyn IndexReader>) -> Result<Self> {
+    pub(crate) async fn try_new(
+        reader: Arc<dyn IndexReader>,
+        index_cache: &LanceCache,
+    ) -> Result<Self> {
         let has_position = reader.schema().field(POSITION_COL).is_some();
         let (offsets, max_scores, lengths) = if reader.schema().field(POSTING_COL).is_none() {
             let (offsets, max_scores) = Self::load_metadata(reader.schema())?;
@@ -827,23 +988,13 @@ impl PostingListReader {
             (None, Some(max_scores), Some(lengths))
         };
 
-        let posting_cache = Cache::builder()
-            .max_capacity(*CACHE_SIZE as u64)
-            .weigher(|_, posting: &PostingList| posting.deep_size_of() as u32)
-            .build();
-        let position_cache = Cache::builder()
-            .max_capacity(*CACHE_SIZE as u64)
-            .weigher(|_, positions: &ListArray| positions.get_array_memory_size() as u32)
-            .build();
-
         Ok(Self {
             reader,
             offsets,
             max_scores,
             lengths,
             has_position,
-            posting_cache,
-            position_cache,
+            index_cache: WeakLanceCache::from(index_cache),
         })
     }
 
@@ -952,16 +1103,19 @@ impl PostingListReader {
         is_phrase_query: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<PostingList> {
+        let cache_key = PostingListKey { token_id };
         let mut posting = self
-            .posting_cache
-            .try_get_with(token_id, async move {
+            .index_cache
+            .get_or_insert_with_key(cache_key, || async move {
                 metrics.record_part_load();
                 info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
                 let batch = self.posting_batch(token_id, false).await?;
-               self.posting_list_from_batch(&batch, token_id)
+                self.posting_list_from_batch(&batch, token_id)
             })
             .await
-            .map_err(|e| Error::io(e.to_string(), location!()))?;
+            .map_err(|e| Error::io(e.to_string(), location!()))?
+            .as_ref()
+            .clone();
 
         if is_phrase_query {
             // hit the cache and when the cache was populated, the positions column was not loaded
@@ -994,10 +1148,26 @@ impl PostingListReader {
         for token_id in 0..self.len() {
             let posting_range = self.posting_list_range(token_id as u32);
             let batch = batch.slice(posting_range.start, posting_range.end - posting_range.start);
+            // Apply shrink_to_fit to create a deep copy with compacted buffers
+            // This ensures each cached entry has its own memory, not shared references
+            let batch = batch.shrink_to_fit()?;
             let posting_list = self.posting_list_from_batch(&batch, token_id as u32)?;
-            self.posting_cache
-                .insert(token_id as u32, posting_list)
+            let inserted = self
+                .index_cache
+                .insert_with_key(
+                    &PostingListKey {
+                        token_id: token_id as u32,
+                    },
+                    Arc::new(posting_list),
+                )
                 .await;
+
+            if !inserted {
+                return Err(Error::Internal {
+                    message: "Failed to prewarm index: cache is no longer available".to_string(),
+                    location: location!(),
+                });
+            }
         }
 
         Ok(())
@@ -1026,23 +1196,25 @@ impl PostingListReader {
     }
 
     async fn read_positions(&self, token_id: u32) -> Result<ListArray> {
-        self.position_cache.try_get_with(token_id, async move {
+        Ok(self.index_cache.get_or_insert_with_key(PositionKey { token_id }, || async move {
             let batch = self
                 .reader
                 .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
                 .await.map_err(|e| {
                     match e {
-                        Error::Schema { .. } => Error::Index {
-                            message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
-                            location: location!(),
-                        },
+                        Error::Schema { .. } => Error::invalid_input(
+                            "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
+                            location!(),
+                        ),
                         e => e
                     }
                 })?;
-            Result::Ok(batch[POSITION_COL]
+            Result::Ok(Positions(batch[POSITION_COL]
                 .as_list::<i32>()
-                .clone())
-        }).await.map_err(|e| Error::io(e.to_string(), location!()))
+                .clone()))
+        }).await.map_err(|e| Error::io(e.to_string(), location!()))?.as_ref()
+            .clone()
+            .0)
     }
 
     fn posting_list_range(&self, token_id: u32) -> Range<usize> {
@@ -1068,6 +1240,48 @@ impl PostingListReader {
             base_columns.push(POSITION_COL);
         }
         base_columns
+    }
+}
+
+/// New type just to allow Positions implement DeepSizeOf so it can be put
+/// in the cache.
+#[derive(Clone)]
+pub struct Positions(ListArray);
+
+impl DeepSizeOf for Positions {
+    fn deep_size_of(&self) -> usize {
+        self.0.get_array_memory_size()
+    }
+
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.0.get_buffer_memory_size()
+    }
+}
+
+// Cache key implementations for type-safe cache access
+#[derive(Debug, Clone)]
+pub struct PostingListKey {
+    pub token_id: u32,
+}
+
+impl CacheKey for PostingListKey {
+    type ValueType = PostingList;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("postings-{}", self.token_id).into()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PositionKey {
+    pub token_id: u32,
+}
+
+impl CacheKey for PositionKey {
+    type ValueType = Positions;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("positions-{}", self.token_id).into()
     }
 }
 
@@ -1097,7 +1311,7 @@ impl PostingList {
         }
     }
 
-    pub fn iter(&self) -> PostingListIterator {
+    pub fn iter(&self) -> PostingListIterator<'_> {
         PostingListIterator::new(self)
     }
 
@@ -1244,7 +1458,7 @@ impl PlainPostingList {
         self.len() == 0
     }
 
-    pub fn iter(&self) -> PlainPostingListIterator {
+    pub fn iter(&self) -> PlainPostingListIterator<'_> {
         Box::new(
             self.row_ids
                 .iter()
@@ -1420,30 +1634,17 @@ impl PostingListBuilder {
     }
 
     // assume the posting list is sorted by doc id
-    pub fn to_batch(mut self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
+    pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
         let length = self.len();
-        let mut position_builder = self.positions.as_mut().map(|_| {
-            ListBuilder::new(ListBuilder::with_capacity(
-                LargeBinaryBuilder::new(),
-                length,
-            ))
-        });
         let max_score = block_max_scores.iter().copied().fold(f32::MIN, f32::max);
-        for index in 0..length {
-            if let Some(position_builder) = position_builder.as_mut() {
-                let positions = self.positions.as_ref().unwrap().get(index);
-                let compressed = compress_positions(positions)?;
-                let inner_builder = position_builder.values();
-                inner_builder.append_value(compressed.into_iter());
-            }
-        }
+
+        let schema = inverted_list_schema(self.has_positions());
         let compressed = compress_posting_list(
             self.doc_ids.len(),
             self.doc_ids.iter(),
             self.frequencies.iter(),
             block_max_scores.into_iter(),
         )?;
-        let schema = inverted_list_schema(self.has_positions());
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, compressed.len() as i32]));
         let mut columns = vec![
             Arc::new(ListArray::try_new(
@@ -1458,11 +1659,22 @@ impl PostingListBuilder {
             ))) as ArrayRef,
         ];
 
-        if let Some(mut position_builder) = position_builder {
+        if let Some(positions) = self.positions.as_ref() {
+            let mut position_builder = ListBuilder::new(ListBuilder::with_capacity(
+                LargeBinaryBuilder::new(),
+                length,
+            ));
+            for index in 0..length {
+                let positions_in_doc = positions.get(index);
+                let compressed = compress_positions(positions_in_doc)?;
+                let inner_builder = position_builder.values();
+                inner_builder.append_value(compressed.into_iter());
+            }
             position_builder.append(true);
             let position_col = position_builder.finish();
             columns.push(Arc::new(position_col));
         }
+
         let batch = RecordBatch::try_new(schema, columns)?;
         Ok(batch)
     }
@@ -1517,7 +1729,7 @@ impl PositionBuilder {
 
     pub fn size(&self) -> usize {
         std::mem::size_of::<u32>() * self.positions.len()
-            + std::mem::size_of::<i32>() * (self.offsets.len() - 1)
+            + std::mem::size_of::<i32>() * self.offsets.len()
     }
 
     pub fn total_len(&self) -> usize {
@@ -1659,6 +1871,9 @@ impl Ord for RawDocInfo {
 pub struct DocSet {
     row_ids: Vec<u64>,
     num_tokens: Vec<u32>,
+    // (row_id, doc_id) pairs sorted by row_id
+    inv: Vec<(u64, u32)>,
+
     total_tokens: u64,
 }
 
@@ -1680,8 +1895,25 @@ impl DocSet {
         self.row_ids[doc_id as usize]
     }
 
-    pub fn row_range(&self) -> RangeInclusive<u64> {
-        self.row_ids[0]..=self.row_ids[self.len() - 1]
+    pub fn doc_id(&self, row_id: u64) -> Option<u64> {
+        if self.inv.is_empty() {
+            // in legacy format, the row id is doc id
+            match self.row_ids.binary_search(&row_id) {
+                Ok(_) => Some(row_id),
+                Err(_) => None,
+            }
+        } else {
+            match self.inv.binary_search_by_key(&row_id, |x| x.0) {
+                Ok(idx) => Some(self.inv[idx].1 as u64),
+                Err(_) => None,
+            }
+        }
+    }
+    pub fn fragment_ids(&self) -> HashSet<u32> {
+        self.row_ids
+            .iter()
+            .map(|row_id| (row_id >> 32) as u32)
+            .collect()
     }
 
     pub fn total_tokens_num(&self) -> u64 {
@@ -1744,43 +1976,57 @@ impl DocSet {
     pub async fn load(
         reader: Arc<dyn IndexReader>,
         is_legacy: bool,
-        fri: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
 
-        let (row_ids, num_tokens) = match is_legacy {
+        let (row_ids, num_tokens, inv) = match is_legacy {
             // for legacy format, the row id is doc id,
             // in order to support efficient search, we need to sort the row ids,
             // so that we can use binary search to get num_tokens
-            true => row_id_col
-                .values()
-                .iter()
-                .filter_map(|id| {
-                    if let Some(fri_ref) = fri.as_ref() {
-                        fri_ref.remap_row_id(*id)
-                    } else {
-                        Some(*id)
-                    }
-                })
-                .zip(num_tokens_col.values().iter())
-                .sorted_unstable_by_key(|x| x.0)
-                .unzip(),
-            false => {
-                let row_ids = row_id_col
+            true => {
+                let (row_ids, num_tokens) = row_id_col
                     .values()
                     .iter()
                     .filter_map(|id| {
-                        if let Some(fri_ref) = fri.as_ref() {
-                            fri_ref.remap_row_id(*id)
+                        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+                            frag_reuse_index_ref.remap_row_id(*id)
+                        } else {
+                            Some(*id)
+                        }
+                    })
+                    .zip(num_tokens_col.values().iter())
+                    .sorted_unstable_by_key(|x| x.0)
+                    .unzip();
+
+                // the legacy format doesn't need to store the inv
+                (row_ids, num_tokens, Vec::new())
+            }
+            false => {
+                let row_ids: Vec<u64> = row_id_col
+                    .values()
+                    .iter()
+                    .filter_map(|id| {
+                        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
+                            frag_reuse_index_ref.remap_row_id(*id)
                         } else {
                             Some(*id)
                         }
                     })
                     .collect();
                 let num_tokens = num_tokens_col.values().to_vec();
-                (row_ids, num_tokens)
+
+                // build the inv
+                let inv = row_ids
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .sorted_unstable()
+                    .map(|(i, row_id)| (row_id, i as u32))
+                    .collect();
+                (row_ids, num_tokens, inv)
             }
         };
 
@@ -1788,6 +2034,7 @@ impl DocSet {
         Ok(Self {
             row_ids,
             num_tokens,
+            inv,
             total_tokens,
         })
     }
@@ -1822,6 +2069,8 @@ impl DocSet {
         self.num_tokens[doc_id as usize]
     }
 
+    // this can be used only if it's a legacy format,
+    // which store the sorted row ids so that we can use binary search
     #[inline]
     pub fn num_tokens_by_row_id(&self, row_id: u64) -> u32 {
         self.row_ids
@@ -1993,7 +2242,17 @@ pub fn is_phrase_query(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use ::object_store::path::Path;
+    use lance_core::cache::LanceCache;
+    use lance_io::object_store::ObjectStore;
+    use tempfile::tempdir;
+
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::prefilter::NoFilter;
+    use crate::scalar::inverted::builder::{InnerBuilder, PositionRecorder};
     use crate::scalar::inverted::encoding::decompress_posting_list;
+    use crate::scalar::inverted::query::{FtsSearchParams, Operator};
+    use crate::scalar::lance_format::LanceIndexStore;
 
     use super::*;
 
@@ -2033,5 +2292,174 @@ mod tests {
             .iter()
             .zip(expected.frequencies.iter())
             .all(|(a, b)| a == b));
+    }
+
+    #[tokio::test]
+    async fn test_remap_to_empty_posting_list() {
+        let tmpdir = tempdir().unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false);
+
+        // index of docs:
+        // 0: lance
+        // 1: lake lake
+        // 2: lake lake lake
+        builder.tokens.add("lance".to_owned());
+        builder.tokens.add("lake".to_owned());
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder.posting_lists[1].add(1, PositionRecorder::Count(2));
+        builder.posting_lists[1].add(2, PositionRecorder::Count(3));
+        builder.docs.append(0, 1);
+        builder.docs.append(1, 1);
+        builder.docs.append(2, 1);
+        builder.write(store.as_ref()).await.unwrap();
+
+        let index = InvertedPartition::load(store.clone(), 0, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let mut builder = index.into_builder().await.unwrap();
+
+        let mapping = HashMap::from([(0, None), (2, Some(3))]);
+        builder.remap(&mapping).await.unwrap();
+
+        // after remap, the doc 0 is removed, and the doc 2 is updated to 3
+        assert_eq!(builder.tokens.len(), 1);
+        assert_eq!(builder.tokens.get("lake"), Some(0));
+        assert_eq!(builder.posting_lists.len(), 1);
+        assert_eq!(builder.posting_lists[0].len(), 2);
+        assert_eq!(builder.docs.len(), 2);
+        assert_eq!(builder.docs.row_id(0), 1);
+        assert_eq!(builder.docs.row_id(1), 3);
+
+        builder.write(store.as_ref()).await.unwrap();
+
+        // remap to delete all docs
+        let mapping = HashMap::from([(1, None), (3, None)]);
+        builder.remap(&mapping).await.unwrap();
+
+        assert_eq!(builder.tokens.len(), 0);
+        assert_eq!(builder.posting_lists.len(), 0);
+        assert_eq!(builder.docs.len(), 0);
+
+        builder.write(store.as_ref()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_posting_cache_conflict_across_partitions() {
+        let tmpdir = tempdir().unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            Path::from_filesystem_path(tmpdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create first partition with one token and posting list length 1
+        let mut builder1 = InnerBuilder::new(0, false);
+        builder1.tokens.add("test".to_owned());
+        builder1.posting_lists.push(PostingListBuilder::new(false));
+        builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder1.docs.append(100, 1); // row_id=100, num_tokens=1
+        builder1.write(store.as_ref()).await.unwrap();
+
+        // Create second partition with one token and posting list length 4
+        let mut builder2 = InnerBuilder::new(1, false);
+        builder2.tokens.add("test".to_owned()); // Use same token to test cache prefix fix
+        builder2.posting_lists.push(PostingListBuilder::new(false));
+        builder2.posting_lists[0].add(0, PositionRecorder::Count(2));
+        builder2.posting_lists[0].add(1, PositionRecorder::Count(1));
+        builder2.posting_lists[0].add(2, PositionRecorder::Count(3));
+        builder2.posting_lists[0].add(3, PositionRecorder::Count(1));
+        builder2.docs.append(200, 2); // row_id=200, num_tokens=2
+        builder2.docs.append(201, 1); // row_id=201, num_tokens=1
+        builder2.docs.append(202, 3); // row_id=202, num_tokens=3
+        builder2.docs.append(203, 1); // row_id=203, num_tokens=1
+        builder2.write(store.as_ref()).await.unwrap();
+
+        // Create metadata file with both partitions
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0u64, 1u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        // Load the inverted index
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        // Verify the index structure
+        assert_eq!(index.partitions.len(), 2);
+        assert_eq!(index.partitions[0].tokens.len(), 1);
+        assert_eq!(index.partitions[1].tokens.len(), 1);
+
+        // Verify the partitions were loaded correctly
+
+        // Verify posting list lengths (note: partition order may differ from creation order)
+        // Verify based on actual loading order
+        if index.partitions[0].id() == 0 {
+            // If partition[0] is ID=0, then it should have 1 document
+            assert_eq!(index.partitions[0].inverted_list.posting_len(0), 1);
+            assert_eq!(index.partitions[1].inverted_list.posting_len(0), 4);
+            assert_eq!(index.partitions[0].docs.len(), 1);
+            assert_eq!(index.partitions[1].docs.len(), 4);
+        } else {
+            // If partition[0] is ID=1, then it should have 4 documents
+            assert_eq!(index.partitions[0].inverted_list.posting_len(0), 4);
+            assert_eq!(index.partitions[1].inverted_list.posting_len(0), 1);
+            assert_eq!(index.partitions[0].docs.len(), 4);
+            assert_eq!(index.partitions[1].docs.len(), 1);
+        }
+
+        // Prewarm the inverted index (this loads posting lists into cache)
+        index.prewarm().await.unwrap();
+
+        let tokens = Arc::new(vec!["test".to_string()]);
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+
+        let (row_ids, scores) = index
+            .bm25_search(tokens, params, Operator::Or, prefilter, metrics)
+            .await
+            .unwrap();
+
+        // Verify that we got search results
+        // Expected to find 5 documents: 1 from first partition, 4 from second partition
+        assert_eq!(row_ids.len(), 5, "row_ids: {:?}", row_ids);
+        assert!(!row_ids.is_empty(), "Should find at least some documents");
+        assert_eq!(row_ids.len(), scores.len());
+
+        // All scores should be positive since all documents contain the search token
+        for &score in &scores {
+            assert!(score > 0.0, "All scores should be positive");
+        }
+
+        // Check that we got results from both partitions
+        assert!(
+            row_ids.contains(&100),
+            "Should contain row_id from partition 0"
+        );
+        assert!(
+            row_ids.iter().any(|&id| id >= 200),
+            "Should contain row_id from partition 1"
+        );
     }
 }

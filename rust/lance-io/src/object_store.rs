@@ -52,10 +52,11 @@ const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
 #[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
 const DEFAULT_CLOUD_BLOCK_SIZE: usize = 64 * 1024; // 64KB block size
 
-lazy_static::lazy_static! {
-    pub static ref DEFAULT_MAX_IOP_SIZE: u64 = std::env::var("LANCE_MAX_IOP_SIZE")
-        .map(|val| val.parse().unwrap()).unwrap_or(16 * 1024 * 1024);
-}
+pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::env::var("LANCE_MAX_IOP_SIZE")
+        .map(|val| val.parse().unwrap())
+        .unwrap_or(16 * 1024 * 1024)
+});
 
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
@@ -86,7 +87,7 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
         let output = self.list(Some(dir_path.into())).map_err(|e| e.into());
         if let Some(unmodified_since_val) = unmodified_since {
             output
-                .try_filter(move |file| future::ready(file.last_modified < unmodified_since_val))
+                .try_filter(move |file| future::ready(file.last_modified <= unmodified_since_val))
                 .boxed()
         } else {
             output.boxed()
@@ -138,7 +139,15 @@ impl std::fmt::Display for ObjectStore {
 }
 
 pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
-    fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+    /// Wrap an object store with additional functionality
+    ///
+    /// The storage_options contain namespace information (e.g., azure_storage_account_name)
+    /// that wrappers may need for proper isolation
+    fn wrap(
+        &self,
+        original: Arc<dyn OSObjectStore>,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Arc<dyn OSObjectStore>;
 }
 
 #[derive(Debug, Clone)]
@@ -157,10 +166,14 @@ impl ChainedWrappingObjectStore {
 }
 
 impl WrappingObjectStore for ChainedWrappingObjectStore {
-    fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
+    fn wrap(
+        &self,
+        original: Arc<dyn OSObjectStore>,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Arc<dyn OSObjectStore> {
         self.wrappers
             .iter()
-            .fold(original, |acc, wrapper| wrapper.wrap(acc))
+            .fold(original, |acc, wrapper| wrapper.wrap(acc, storage_options))
     }
 }
 
@@ -235,6 +248,11 @@ impl Eq for ObjectStoreParams {}
 impl PartialEq for ObjectStoreParams {
     #[allow(deprecated)]
     fn eq(&self, other: &Self) -> bool {
+        #[cfg(feature = "aws")]
+        if self.aws_credentials.is_some() != other.aws_credentials.is_some() {
+            return false;
+        }
+
         // For equality, we use pointer comparison for ObjectStore, S3 credentials, and wrapper
         self.block_size == other.block_size
             && self
@@ -246,8 +264,6 @@ impl PartialEq for ObjectStoreParams {
                     .as_ref()
                     .map(|(store, url)| (Arc::as_ptr(store), url))
             && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
-            && self.aws_credentials.as_ref().map(Arc::as_ptr)
-                == other.aws_credentials.as_ref().map(Arc::as_ptr)
             && self.object_store_wrapper.as_ref().map(Arc::as_ptr)
                 == other.object_store_wrapper.as_ref().map(Arc::as_ptr)
             && self.storage_options == other.storage_options
@@ -319,7 +335,7 @@ impl ObjectStore {
         if let Some((store, path)) = params.object_store.as_ref() {
             let mut inner = store.clone();
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
-                inner = wrapper.wrap(inner);
+                inner = wrapper.wrap(inner, params.storage_options.as_ref());
             }
             let store = Self {
                 inner,
@@ -331,14 +347,14 @@ impl ObjectStore {
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
             };
-            let path = Path::from(path.path());
+            let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
         }
         let url = uri_to_url(uri)?;
         let store = registry.get_store(url.clone(), params).await?;
         // We know the scheme is valid if we got a store back.
         let provider = registry.get_provider(url.scheme()).expect_ok()?;
-        let path = provider.extract_path(&url);
+        let path = provider.extract_path(&url)?;
 
         Ok((store, path))
     }
@@ -682,12 +698,13 @@ impl ObjectStore {
         list_is_lexically_ordered: bool,
         io_parallelism: usize,
         download_retry_count: usize,
+        storage_options: Option<&HashMap<String, String>>,
     ) -> Self {
         let scheme = location.scheme();
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
 
         let store = match wrapper {
-            Some(wrapper) => wrapper.wrap(store),
+            Some(wrapper) => wrapper.wrap(store, storage_options),
             None => store,
         };
 
@@ -922,7 +939,11 @@ mod tests {
     }
 
     impl WrappingObjectStore for TestWrapper {
-        fn wrap(&self, _original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
+        fn wrap(
+            &self,
+            _original: Arc<dyn OSObjectStore>,
+            _storage_options: Option<&HashMap<String, String>>,
+        ) -> Arc<dyn OSObjectStore> {
             self.called.store(true, Ordering::Relaxed);
 
             // return a mocked value so we can check if the final store is the one we expect

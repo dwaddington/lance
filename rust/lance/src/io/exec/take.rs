@@ -318,7 +318,7 @@ impl DisplayAs for TakeExec {
                 if extra_fields.contains(name) {
                     format!("({})", name)
                 } else {
-                    name.to_string()
+                    name.clone()
                 }
             })
             .collect::<Vec<_>>()
@@ -540,9 +540,12 @@ impl ExecutionPlan for TakeExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Result<datafusion::physical_plan::Statistics> {
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> Result<datafusion::physical_plan::Statistics> {
         Ok(Statistics {
-            num_rows: self.input.statistics()?.num_rows,
+            num_rows: self.input.partition_statistics(partition)?.num_rows,
             ..Statistics::new_unknown(self.schema().as_ref())
         })
     }
@@ -925,7 +928,7 @@ mod tests {
         let fixture = NoContextTestFixture::new();
         let arc_dasaset = Arc::new(fixture.dataset);
 
-        let input = lance_datagen::gen()
+        let input = lance_datagen::gen_batch()
             .col(ROW_ID, lance_datagen::array::step::<UInt64Type>())
             .into_df_exec(RowCount::from(50), BatchCount::from(2));
 

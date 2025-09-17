@@ -21,9 +21,9 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
-use lazy_static::lazy_static;
 use object_store::path::Path;
 use snafu::location;
+use std::sync::LazyLock;
 use tempfile::{tempdir, TempDir};
 use tracing::instrument;
 
@@ -38,42 +38,48 @@ use super::{
 // WARNING: changing this value will break the compatibility with existing indexes
 pub const BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 
-lazy_static! {
-    // the (compressed) size of each flush for posting lists in MiB,
-    // when the `LANCE_FTS_FLUSH_THRESHOLD` is reached, the flush will be triggered,
-    // higher for better indexing performance, but more memory usage,
-    // it's in 16 MiB by default
-    static ref LANCE_FTS_FLUSH_SIZE: usize = std::env::var("LANCE_FTS_FLUSH_SIZE")
+// the (compressed) size of each flush for posting lists in MiB,
+// when the `LANCE_FTS_FLUSH_THRESHOLD` is reached, the flush will be triggered,
+// higher for better indexing performance, but more memory usage,
+// it's in 16 MiB by default
+static LANCE_FTS_FLUSH_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_FLUSH_SIZE")
         .unwrap_or_else(|_| "16".to_string())
         .parse()
-        .expect("failed to parse LANCE_FTS_FLUSH_SIZE");
-    // the number of shards to split the indexing work,
-    // the indexing process would spawn `LANCE_FTS_NUM_SHARDS` workers to build FTS,
-    // higher for faster indexing performance, but more memory usage,
-    // it's `the number of compute intensive CPUs` by default
-    pub static ref LANCE_FTS_NUM_SHARDS: usize = std::env::var("LANCE_FTS_NUM_SHARDS")
-        .unwrap_or_else(|_|  get_num_compute_intensive_cpus().to_string())
+        .expect("failed to parse LANCE_FTS_FLUSH_SIZE")
+});
+// the number of shards to split the indexing work,
+// the indexing process would spawn `LANCE_FTS_NUM_SHARDS` workers to build FTS,
+// higher for faster indexing performance, but more memory usage,
+// it's `the number of compute intensive CPUs` by default
+pub static LANCE_FTS_NUM_SHARDS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_NUM_SHARDS")
+        .unwrap_or_else(|_| get_num_compute_intensive_cpus().to_string())
         .parse()
-        .expect("failed to parse LANCE_FTS_NUM_SHARDS");
-    // the partition size limit in MiB (uncompressed format)
-    // higher for better indexing & query performance, but more memory usage,
-    pub static ref LANCE_FTS_PARTITION_SIZE: u64 = std::env::var("LANCE_FTS_PARTITION_SIZE")
+        .expect("failed to parse LANCE_FTS_NUM_SHARDS")
+});
+// the partition size limit in MiB (uncompressed format)
+// higher for better indexing & query performance, but more memory usage,
+pub static LANCE_FTS_PARTITION_SIZE: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_PARTITION_SIZE")
         .unwrap_or_else(|_| "256".to_string())
         .parse()
-        .expect("failed to parse LANCE_FTS_PARTITION_SIZE");
-    // the target size of partition after merging in MiB (uncompressed format)
-    pub static ref LANCE_FTS_TARGET_SIZE: u64 = std::env::var("LANCE_FTS_TARGET_SIZE")
+        .expect("failed to parse LANCE_FTS_PARTITION_SIZE")
+});
+// the target size of partition after merging in MiB (uncompressed format)
+pub static LANCE_FTS_TARGET_SIZE: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_TARGET_SIZE")
         .unwrap_or_else(|_| "4096".to_string())
         .parse()
-        .expect("failed to parse LANCE_FTS_TARGET_SIZE");
-}
+        .expect("failed to parse LANCE_FTS_TARGET_SIZE")
+});
 
 #[derive(Debug)]
 pub struct InvertedIndexBuilder {
     params: InvertedIndexParams,
-    partitions: Vec<u64>,
+    pub(crate) partitions: Vec<u64>,
     new_partitions: Vec<u64>,
-
+    fragment_mask: Option<u64>,
     _tmpdir: TempDir,
     local_store: Arc<dyn IndexStore>,
     src_store: Arc<dyn IndexStore>,
@@ -81,13 +87,24 @@ pub struct InvertedIndexBuilder {
 
 impl InvertedIndexBuilder {
     pub fn new(params: InvertedIndexParams) -> Self {
-        Self::from_existing_index(params, None, Vec::new())
+        Self::new_with_fragment_mask(params, None)
     }
 
+    pub fn new_with_fragment_mask(params: InvertedIndexParams, fragment_mask: Option<u64>) -> Self {
+        Self::from_existing_index(params, None, Vec::new(), fragment_mask)
+    }
+
+    /// Creates an InvertedIndexBuilder from existing index with fragment filtering.
+    /// This method is used to create a builder from an existing index while applying
+    /// fragment-based filtering for distributed indexing scenarios.
+    /// fragment_mask Optional mask with fragment_id in high 32 bits for filtering.
+    /// Constructed as `(fragment_id as u64) << 32`.
+    /// When provided, ensures that generated IDs belong to the specified fragment.
     pub fn from_existing_index(
         params: InvertedIndexParams,
         store: Option<Arc<dyn IndexStore>>,
         partitions: Vec<u64>,
+        fragment_mask: Option<u64>,
     ) -> Self {
         let tmpdir = tempdir().unwrap();
         let local_store = Arc::new(LanceIndexStore::new(
@@ -103,6 +120,7 @@ impl InvertedIndexBuilder {
             _tmpdir: tmpdir,
             local_store,
             src_store,
+            fragment_mask,
         }
     }
 
@@ -147,9 +165,11 @@ impl InvertedIndexBuilder {
             let tokenizer = tokenizer.clone();
             let receiver = receiver.clone();
             let id_alloc = id_alloc.clone();
+            let fragment_mask = self.fragment_mask;
             let task = tokio::task::spawn(async move {
                 let mut worker =
-                    IndexWorker::new(store, tokenizer, with_position, id_alloc).await?;
+                    IndexWorker::new(store, tokenizer, with_position, id_alloc, fragment_mask)
+                        .await?;
                 while let Ok(batch) = receiver.recv().await {
                     worker.process_batch(batch).await?;
                 }
@@ -212,12 +232,21 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
         for part in self.partitions.iter() {
-            let part = InvertedPartition::load(src_store.clone(), *part, None).await?;
+            let part =
+                InvertedPartition::load(src_store.clone(), *part, None, &LanceCache::no_cache())
+                    .await?;
             let mut builder = part.into_builder().await?;
             builder.remap(mapping).await?;
             builder.write(dest_store).await?;
         }
-        self.write_metadata(dest_store, &self.partitions).await?;
+        if self.fragment_mask.is_none() {
+            self.write_metadata(dest_store, &self.partitions).await?;
+        } else {
+            // in distributed mode, the part_temp_metadata is written by the worker
+            for &partition_id in &self.partitions {
+                self.write_part_metadata(dest_store, partition_id).await?;
+            }
+        }
         Ok(())
     }
 
@@ -233,20 +262,50 @@ impl InvertedIndexBuilder {
         Ok(())
     }
 
-    async fn write(&self, dest_store: &dyn IndexStore) -> Result<()> {
-        let partitions =
-            futures::future::try_join_all(
-                self.partitions
-                    .iter()
-                    .map(|part| InvertedPartition::load(self.src_store.clone(), *part, None))
-                    .chain(self.new_partitions.iter().map(|part| {
-                        InvertedPartition::load(self.local_store.clone(), *part, None)
-                    })),
-            )
+    /// Write partition metadata file for a single partition
+    ///
+    /// In a distributed environment, each worker node can write partition metadata files for the partitions it processes,
+    /// which are then merged into a final metadata file using the `merge_metadata_files` function.
+    pub(crate) async fn write_part_metadata(
+        &self,
+        dest_store: &dyn IndexStore,
+        partition: u64, // Modify parameter type
+    ) -> Result<()> {
+        let partitions = vec![partition];
+        let metadata = HashMap::from_iter(vec![
+            ("partitions".to_owned(), serde_json::to_string(&partitions)?),
+            ("params".to_owned(), serde_json::to_string(&self.params)?),
+        ]);
+        // Use partition ID to generate a unique temporary filename
+        let file_name = part_metadata_file_path(partition);
+        let mut writer = dest_store
+            .new_index_file(&file_name, Arc::new(Schema::empty()))
             .await?;
+        writer.finish_with_metadata(metadata).await?;
+        Ok(())
+    }
+
+    async fn write(&self, dest_store: &dyn IndexStore) -> Result<()> {
+        let no_cache = LanceCache::no_cache();
+        let partitions = futures::future::try_join_all(
+            self.partitions
+                .iter()
+                .map(|part| InvertedPartition::load(self.src_store.clone(), *part, None, &no_cache))
+                .chain(self.new_partitions.iter().map(|part| {
+                    InvertedPartition::load(self.local_store.clone(), *part, None, &no_cache)
+                })),
+        )
+        .await?;
         let mut merger = SizeBasedMerger::new(dest_store, partitions, *LANCE_FTS_TARGET_SIZE << 20);
         let partitions = merger.merge().await?;
-        self.write_metadata(dest_store, &partitions).await?;
+
+        if self.fragment_mask.is_none() {
+            self.write_metadata(dest_store, &partitions).await?;
+        } else {
+            for &partition_id in &partitions {
+                self.write_part_metadata(dest_store, partition_id).await?;
+            }
+        }
         Ok(())
     }
 }
@@ -262,15 +321,17 @@ impl Default for InvertedIndexBuilder {
 #[derive(Debug)]
 pub struct InnerBuilder {
     id: u64,
+    with_position: bool,
     pub(crate) tokens: TokenSet,
     pub(crate) posting_lists: Vec<PostingListBuilder>,
     pub(crate) docs: DocSet,
 }
 
 impl InnerBuilder {
-    pub fn new(id: u64) -> Self {
+    pub fn new(id: u64, with_position: bool) -> Self {
         Self {
             id,
+            with_position,
             tokens: TokenSet::default(),
             posting_lists: Vec::new(),
             docs: DocSet::default(),
@@ -282,12 +343,28 @@ impl InnerBuilder {
     }
 
     pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        // no need to remap the TokenSet,
-        // no row_id is stored in the TokenSet
+        // for the docs, we need to remove the rows that are removed from the doc set,
+        // and update the row ids of the rows that are updated
         let removed = self.docs.remap(mapping);
-        for posting_list in self.posting_lists.iter_mut() {
+
+        // for the posting lists, we need to remap the doc ids:
+        // - if the a row is removed, we need to shift the doc ids of the following rows
+        // - if a row is updated (assigned a new row id), we don't need to do anything with the posting lists
+        let mut token_id = 0;
+        let mut removed_token_ids = Vec::new();
+        self.posting_lists.retain_mut(|posting_list| {
             posting_list.remap(&removed);
-        }
+            let keep = !posting_list.is_empty();
+            if !keep {
+                removed_token_ids.push(token_id as u32);
+            }
+            token_id += 1;
+            keep
+        });
+
+        // for the tokens, remap the token ids if any posting list is empty
+        self.tokens.remap(&removed_token_ids);
+
         Ok(())
     }
 
@@ -309,7 +386,7 @@ impl InnerBuilder {
         let mut writer = store
             .new_index_file(
                 &posting_file_path(self.id),
-                inverted_list_schema(self.posting_lists[0].has_positions()),
+                inverted_list_schema(self.with_position),
             )
             .await?;
         let posting_lists = std::mem::take(&mut self.posting_lists);
@@ -318,9 +395,9 @@ impl InnerBuilder {
             "writing {} posting lists of partition {}, with position {}",
             posting_lists.len(),
             id,
-            posting_lists[0].has_positions()
+            self.with_position
         );
-        let schema = inverted_list_schema(posting_lists[0].has_positions());
+        let schema = inverted_list_schema(self.with_position);
 
         let mut batches = stream::iter(posting_lists)
             .map(|posting_list| {
@@ -402,6 +479,7 @@ struct IndexWorker {
     schema: SchemaRef,
     estimated_size: u64,
     total_doc_length: usize,
+    fragment_mask: Option<u64>,
 }
 
 impl IndexWorker {
@@ -410,18 +488,24 @@ impl IndexWorker {
         tokenizer: tantivy::tokenizer::TextAnalyzer,
         with_position: bool,
         id_alloc: Arc<AtomicU64>,
+        fragment_mask: Option<u64>,
     ) -> Result<Self> {
         let schema = inverted_list_schema(with_position);
 
         Ok(Self {
             store,
             tokenizer,
-            builder: InnerBuilder::new(id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            builder: InnerBuilder::new(
+                id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    | fragment_mask.unwrap_or(0),
+                with_position,
+            ),
             partitions: Vec::new(),
             id_alloc,
             schema,
             estimated_size: 0,
             total_doc_length: 0,
+            fragment_mask,
         })
     }
 
@@ -494,16 +578,18 @@ impl IndexWorker {
             self.estimated_size / (1024 * 1024)
         );
         self.estimated_size = 0;
+        let with_position = self.has_position();
         let mut builder = std::mem::replace(
             &mut self.builder,
             InnerBuilder::new(
                 self.id_alloc
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    | self.fragment_mask.unwrap_or(0),
+                with_position,
             ),
         );
         builder.write(self.store.as_ref()).await?;
-        self.partitions.push(builder.id);
-
+        self.partitions.push(builder.id());
         Ok(())
     }
 
@@ -685,4 +771,183 @@ pub(crate) fn posting_file_path(partition_id: u64) -> String {
 
 pub(crate) fn doc_file_path(partition_id: u64) -> String {
     format!("part_{}_{}", partition_id, DOCS_FILE)
+}
+
+pub(crate) fn part_metadata_file_path(partition_id: u64) -> String {
+    format!("part_{}_{}", partition_id, METADATA_FILE)
+}
+
+pub async fn merge_index_files(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+    store: Arc<dyn IndexStore>,
+) -> Result<()> {
+    // List all partition metadata files in the index directory
+    let part_metadata_files = list_metadata_files(object_store, index_dir).await?;
+
+    // Call merge_metadata_files function for inverted index
+    merge_metadata_files(store, &part_metadata_files).await
+}
+
+/// List and filter metadata files from the index directory
+/// Returns partition metadata files
+async fn list_metadata_files(object_store: &ObjectStore, index_dir: &Path) -> Result<Vec<String>> {
+    // List all partition metadata files in the index directory
+    let mut part_metadata_files = Vec::new();
+    let mut list_stream = object_store.list(Some(index_dir.clone()));
+
+    while let Some(item) = list_stream.next().await {
+        match item {
+            Ok(meta) => {
+                let file_name = meta.location.filename().unwrap_or_default();
+                // Filter files matching the pattern part_*_metadata.lance
+                if file_name.starts_with("part_") && file_name.ends_with("_metadata.lance") {
+                    part_metadata_files.push(file_name.to_string());
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    if part_metadata_files.is_empty() {
+        return Err(Error::InvalidInput {
+            source: format!(
+                "No partition metadata files found in index directory: {}",
+                index_dir
+            )
+            .into(),
+            location: location!(),
+        });
+    }
+
+    Ok(part_metadata_files)
+}
+
+/// Merge partition metadata files with partition ID remapping to sequential IDs starting from 0
+async fn merge_metadata_files(
+    store: Arc<dyn IndexStore>,
+    part_metadata_files: &[String],
+) -> Result<()> {
+    // Collect all partition IDs and params
+    let mut all_partitions = Vec::new();
+    let mut params = None;
+
+    for file_name in part_metadata_files {
+        let reader = store.open_index_file(file_name).await?;
+        let metadata = &reader.schema().metadata;
+
+        let partitions_str = metadata.get("partitions").ok_or(Error::Index {
+            message: format!("partitions not found in {}", file_name),
+            location: location!(),
+        })?;
+
+        let partition_ids: Vec<u64> =
+            serde_json::from_str(partitions_str).map_err(|e| Error::Index {
+                message: format!("Failed to parse partitions: {}", e),
+                location: location!(),
+            })?;
+
+        all_partitions.extend(partition_ids);
+
+        if params.is_none() {
+            let params_str = metadata.get("params").ok_or(Error::Index {
+                message: format!("params not found in {}", file_name),
+                location: location!(),
+            })?;
+            params = Some(
+                serde_json::from_str::<InvertedIndexParams>(params_str).map_err(|e| {
+                    Error::Index {
+                        message: format!("Failed to parse params: {}", e),
+                        location: location!(),
+                    }
+                })?,
+            );
+        }
+    }
+
+    // Create ID mapping: sorted original IDs -> 0,1,2...
+    let mut sorted_ids = all_partitions.clone();
+    sorted_ids.sort();
+    sorted_ids.dedup();
+
+    let id_mapping: HashMap<u64, u64> = sorted_ids
+        .iter()
+        .enumerate()
+        .map(|(new_id, &old_id)| (old_id, new_id as u64))
+        .collect();
+
+    // Safe rename partition files using temporary files to avoid overwrite
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Phase 1: Move files to temporary locations
+    let mut temp_files: Vec<(String, String, String)> = Vec::new(); // (temp_path, old_path, final_path)
+
+    for (&old_id, &new_id) in &id_mapping {
+        if old_id != new_id {
+            for suffix in [TOKENS_FILE, INVERT_LIST_FILE, DOCS_FILE] {
+                let old_path = format!("part_{}_{}", old_id, suffix);
+                let new_path = format!("part_{}_{}", new_id, suffix);
+                let temp_path = format!("temp_{}_{}", timestamp, old_path);
+
+                // Move to temporary location first to avoid overwrite
+                if let Err(e) = store.rename_index_file(&old_path, &temp_path).await {
+                    // Rollback phase 1: restore files from temp locations
+                    for (temp_name, old_name, _) in temp_files.iter().rev() {
+                        let _ = store.rename_index_file(temp_name, old_name).await;
+                    }
+                    return Err(Error::Index {
+                        message: format!(
+                            "Failed to move {} to temp {}: {}",
+                            old_path, temp_path, e
+                        ),
+                        location: location!(),
+                    });
+                }
+                temp_files.push((temp_path, old_path, new_path));
+            }
+        }
+    }
+
+    // Phase 2: Move from temporary to final locations
+    let mut completed_renames: Vec<(String, String)> = Vec::new(); // (final_path, temp_path)
+
+    for (temp_path, _old_path, final_path) in &temp_files {
+        if let Err(e) = store.rename_index_file(temp_path, final_path).await {
+            // Rollback phase 2: restore completed renames and remaining temps
+            for (final_name, temp_name) in completed_renames.iter().rev() {
+                let _ = store.rename_index_file(final_name, temp_name).await;
+            }
+            // Restore remaining temp files to original locations
+            for (temp_name, orig_name, _) in temp_files.iter() {
+                if !completed_renames.iter().any(|(_, t)| t == temp_name) {
+                    let _ = store.rename_index_file(temp_name, orig_name).await;
+                }
+            }
+            return Err(Error::Index {
+                message: format!("Failed to rename {} to {}: {}", temp_path, final_path, e),
+                location: location!(),
+            });
+        }
+        completed_renames.push((final_path.clone(), temp_path.clone()));
+    }
+
+    // Write merged metadata with remapped IDs
+    let remapped_partitions: Vec<u64> = (0..id_mapping.len() as u64).collect();
+    let params = params.unwrap_or_default();
+    let builder = InvertedIndexBuilder::new_with_fragment_mask(params, None);
+    builder
+        .write_metadata(&*store, &remapped_partitions)
+        .await?;
+
+    // Cleanup partition metadata files
+    for file_name in part_metadata_files {
+        if file_name.starts_with("part_") && file_name.ends_with("_metadata.lance") {
+            let _ = store.delete_index_file(file_name).await;
+        }
+    }
+
+    Ok(())
 }

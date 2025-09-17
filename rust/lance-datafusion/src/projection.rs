@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema};
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, SchemaRef};
-use datafusion::{
-    execution::SendableRecordBatchStream, logical_expr::Expr,
-    physical_plan::projection::ProjectionExec,
-};
-use datafusion_common::DFSchema;
-use datafusion_physical_expr::{expressions, PhysicalExpr};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use datafusion::{logical_expr::Expr, physical_plan::projection::ProjectionExec};
+use datafusion_common::{Column, DFSchema};
+use datafusion_physical_expr::PhysicalExpr;
 use futures::TryStreamExt;
 use snafu::location;
 use std::{
@@ -18,8 +14,8 @@ use std::{
 };
 
 use lance_core::{
-    datatypes::{Field, Schema, BLOB_DESC_FIELDS, BLOB_META_KEY},
-    Error, Result,
+    datatypes::{OnMissing, Projectable, Projection, Schema},
+    Error, Result, ROW_ADDR, ROW_ID, ROW_OFFSET,
 };
 
 use crate::{
@@ -27,63 +23,54 @@ use crate::{
     planner::Planner,
 };
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
+pub struct OutputColumn {
+    /// The expression that represents the output column
+    pub expr: Expr,
+    /// The name of the output column
+    pub name: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct ProjectionPlan {
-    /// The physical schema (before dynamic projection) that must be loaded from the dataset
-    pub physical_schema: Arc<Schema>,
-    pub physical_df_schema: Arc<DFSchema>,
+    /// The physical schema that must be loaded from the dataset
+    pub physical_projection: Projection,
 
-    /// The schema of the sibling fields that must be loaded
-    pub sibling_schema: Option<Arc<Schema>>,
+    /// Needs the row address converted into a row offset
+    pub must_add_row_offset: bool,
 
-    /// The expressions for all the columns to be in the output
-    /// Note: this doesn't include _distance, and _rowid
-    pub requested_output_expr: Option<Vec<(Expr, String)>>,
+    /// The desired output columns
+    pub requested_output_expr: Vec<OutputColumn>,
 }
 
 impl ProjectionPlan {
-    fn unload_blobs(schema: &Arc<Schema>) -> Arc<Schema> {
-        let mut modified = false;
-        let fields = schema
-            .fields
-            .iter()
-            .map(|f| {
-                if f.metadata.contains_key(BLOB_META_KEY) {
-                    debug_assert!(f.data_type() == DataType::LargeBinary);
-                    modified = true;
-                    let mut unloaded_field = Field::try_from(ArrowField::new(
-                        f.name.clone(),
-                        DataType::Struct(BLOB_DESC_FIELDS.clone()),
-                        f.nullable,
-                    ))
-                    .unwrap();
-                    unloaded_field.id = f.id;
-                    unloaded_field
-                } else {
-                    f.clone()
-                }
-            })
-            .collect();
-
-        if modified {
-            let mut schema = schema.as_ref().clone();
-            schema.fields = fields;
-            Arc::new(schema)
-        } else {
-            schema.clone()
-        }
+    fn add_system_columns(schema: &ArrowSchema) -> ArrowSchema {
+        let mut fields = Vec::from_iter(schema.fields.iter().cloned());
+        fields.push(Arc::new(ArrowField::new(ROW_ID, DataType::UInt64, true)));
+        fields.push(Arc::new(ArrowField::new(ROW_ADDR, DataType::UInt64, true)));
+        fields.push(Arc::new(ArrowField::new(
+            ROW_OFFSET,
+            DataType::UInt64,
+            true,
+        )));
+        ArrowSchema::new(fields)
     }
 
-    pub fn try_new(
-        base_schema: &Schema,
+    /// Set the projection from SQL expressions
+    pub fn from_expressions(
+        base: Arc<dyn Projectable>,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
-        load_blobs: bool,
     ) -> Result<Self> {
-        let arrow_schema = Arc::new(ArrowSchema::from(base_schema));
-        let planner = Planner::new(arrow_schema);
+        // First, look at the expressions to figure out which physical columns are needed
+        let full_schema = Arc::new(Projection::full(base.clone()).to_arrow_schema());
+        let full_schema = Arc::new(Self::add_system_columns(&full_schema));
+        let planner = Planner::new(full_schema);
         let mut output = HashMap::new();
         let mut physical_cols_set = HashSet::new();
         let mut physical_cols = vec![];
+        let mut needs_row_id = false;
+        let mut needs_row_addr = false;
+        let mut must_add_row_offset = false;
         for (output_name, raw_expr) in columns {
             if output.contains_key(output_name.as_ref()) {
                 return Err(Error::io(
@@ -91,7 +78,25 @@ impl ProjectionPlan {
                     location!(),
                 ));
             }
+
             let expr = planner.parse_expr(raw_expr.as_ref())?;
+
+            // If the expression is a bare column reference to a system column, mark that we need it
+            if let Expr::Column(Column {
+                name,
+                relation: None,
+                ..
+            }) = &expr
+            {
+                if name == ROW_ID {
+                    needs_row_id = true;
+                } else if name == ROW_ADDR {
+                    needs_row_addr = true;
+                } else if name == ROW_OFFSET {
+                    must_add_row_offset = true;
+                }
+            }
+
             for col in Planner::column_names_in_expr(&expr) {
                 if physical_cols_set.contains(&col) {
                     continue;
@@ -102,105 +107,194 @@ impl ProjectionPlan {
             output.insert(output_name.as_ref().to_string(), expr);
         }
 
-        let physical_schema = Arc::new(base_schema.project(&physical_cols)?);
-        let (physical_schema, sibling_schema) = physical_schema.partition_by_storage_class();
-        let mut physical_schema = Arc::new(physical_schema);
-        if !load_blobs {
-            physical_schema = Self::unload_blobs(&physical_schema);
-        }
+        // Now, calculate the physical projection from the columns referenced by the expressions
+        //
+        // If a column is missing it might be a metadata column (_rowid, _distance, etc.) and so
+        // we ignore it.  We don't need to load that column from disk at least, which is all we are
+        // trying to calculate here.
+        let mut physical_projection =
+            Projection::empty(base.clone()).union_columns(&physical_cols, OnMissing::Ignore)?;
 
+        physical_projection.with_row_id = needs_row_id;
+        physical_projection.with_row_addr = needs_row_addr || must_add_row_offset;
+
+        // Save off the expressions (they will be evaluated later to run the projection)
         let mut output_cols = vec![];
         for (name, _) in columns {
-            output_cols.push((output[name.as_ref()].clone(), name.as_ref().to_string()));
+            output_cols.push(OutputColumn {
+                expr: output[name.as_ref()].clone(),
+                name: name.as_ref().to_string(),
+            });
         }
-        let requested_output_expr = Some(output_cols);
-        let physical_arrow_schema = ArrowSchema::from(physical_schema.as_ref());
-        let physical_df_schema = Arc::new(DFSchema::try_from(physical_arrow_schema).unwrap());
+
         Ok(Self {
-            physical_schema,
-            sibling_schema: sibling_schema.map(Arc::new),
-            physical_df_schema,
-            requested_output_expr,
+            physical_projection,
+            must_add_row_offset,
+            requested_output_expr: output_cols,
         })
     }
 
-    pub fn new_empty(base_schema: Arc<Schema>, load_blobs: bool) -> Self {
-        let (physical_schema, sibling_schema) = base_schema.partition_by_storage_class();
-        Self::inner_new(
-            Arc::new(physical_schema),
-            load_blobs,
-            sibling_schema.map(Arc::new),
-        )
+    /// Set the projection from a schema
+    ///
+    /// This plan will have no complex expressions, the schema must be a subset of the dataset schema.
+    ///
+    /// With this approach it is possible to refer to portions of nested fields.
+    ///
+    /// For example, if the schema is:
+    ///
+    /// ```ignore
+    /// {
+    ///   "metadata": {
+    ///     "location": {
+    ///       "x": f32,
+    ///       "y": f32,
+    ///     },
+    ///     "age": i32,
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// It is possible to project a partial schema that drops `y` like:
+    ///
+    /// ```ignore
+    /// {
+    ///   "metadata": {
+    ///     "location": {
+    ///       "x": f32,
+    ///     },
+    ///     "age": i32,
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// This is something that cannot be done easily using expressions.
+    pub fn from_schema(base: Arc<dyn Projectable>, projection: &Schema) -> Result<Self> {
+        // Calculate the physical projection directly from the schema
+        //
+        // The _rowid and _rowaddr columns will be recognized and added to the physical projection
+        //
+        // Any columns with an id of -1 (e.g. _rowoffset) will be ignored
+        let physical_projection = Projection::empty(base).union_schema(projection);
+        let mut must_add_row_offset = false;
+        // Now calculate the output expressions.  This will only reorder top-level columns.  We don't
+        // support reordering nested fields.
+        let exprs = projection
+            .fields
+            .iter()
+            .map(|f| {
+                if f.name == ROW_ADDR {
+                    must_add_row_offset = true;
+                }
+                OutputColumn {
+                    expr: Expr::Column(Column::from_name(&f.name)),
+                    name: f.name.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(Self {
+            physical_projection,
+            requested_output_expr: exprs,
+            must_add_row_offset,
+        })
     }
 
-    pub fn inner_new(
-        base_schema: Arc<Schema>,
-        load_blobs: bool,
-        sibling_schema: Option<Arc<Schema>>,
-    ) -> Self {
-        let physical_schema = if !load_blobs {
-            Self::unload_blobs(&base_schema)
-        } else {
-            base_schema
-        };
+    pub fn full(base: Arc<dyn Projectable>) -> Result<Self> {
+        let projection = base
+            .schema()
+            .fields
+            .iter()
+            .map(|f| (f.name.as_str(), format!("`{}`", f.name.as_str())))
+            .collect::<Vec<_>>();
+        Self::from_expressions(base.clone(), &projection)
+    }
 
-        let physical_arrow_schema = ArrowSchema::from(physical_schema.as_ref());
-        let physical_df_schema = Arc::new(DFSchema::try_from(physical_arrow_schema).unwrap());
-        Self {
-            physical_schema,
-            sibling_schema,
-            physical_df_schema,
-            requested_output_expr: None,
+    /// Convert the projection to a list of physical expressions
+    ///
+    /// This is used to apply the final projection (including dynamic expressions) to the data.
+    pub fn to_physical_exprs(
+        &self,
+        current_schema: &ArrowSchema,
+    ) -> Result<Vec<(Arc<dyn PhysicalExpr>, String)>> {
+        let physical_df_schema = Arc::new(DFSchema::try_from(current_schema.clone())?);
+        self.requested_output_expr
+            .iter()
+            .map(|output_column| {
+                Ok((
+                    datafusion::physical_expr::create_physical_expr(
+                        &output_column.expr,
+                        physical_df_schema.as_ref(),
+                        &Default::default(),
+                    )?,
+                    output_column.name.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Include the row id in the output
+    pub fn include_row_id(&mut self) {
+        self.physical_projection.with_row_id = true;
+        if !self
+            .requested_output_expr
+            .iter()
+            .any(|OutputColumn { name, .. }| name == ROW_ID)
+        {
+            self.requested_output_expr.push(OutputColumn {
+                expr: Expr::Column(Column::from_name(ROW_ID)),
+                name: ROW_ID.to_string(),
+            });
         }
     }
 
-    pub fn arrow_schema(&self) -> &ArrowSchema {
-        self.physical_df_schema.as_arrow()
-    }
-
-    pub fn arrow_schema_ref(&self) -> SchemaRef {
-        Arc::new(self.physical_df_schema.as_arrow().clone())
-    }
-
-    pub fn to_physical_exprs(&self) -> Result<Vec<(Arc<dyn PhysicalExpr>, String)>> {
-        if let Some(output_expr) = &self.requested_output_expr {
-            output_expr
-                .iter()
-                .map(|(expr, name)| {
-                    Ok((
-                        datafusion::physical_expr::create_physical_expr(
-                            expr,
-                            self.physical_df_schema.as_ref(),
-                            &Default::default(),
-                        )?,
-                        name.clone(),
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()
-        } else {
-            self.physical_schema
-                .fields
-                .iter()
-                .map(|f| {
-                    Ok((
-                        expressions::col(f.name.as_str(), self.physical_df_schema.as_arrow())?
-                            .clone(),
-                        f.name.clone(),
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()
+    /// Include the row address in the output
+    pub fn include_row_addr(&mut self) {
+        self.physical_projection.with_row_addr = true;
+        if !self
+            .requested_output_expr
+            .iter()
+            .any(|OutputColumn { name, .. }| name == ROW_ADDR)
+        {
+            self.requested_output_expr.push(OutputColumn {
+                expr: Expr::Column(Column::from_name(ROW_ADDR)),
+                name: ROW_ADDR.to_string(),
+            });
         }
+    }
+
+    pub fn include_row_offset(&mut self) {
+        // Need row addr to get row offset
+        self.physical_projection.with_row_addr = true;
+        self.must_add_row_offset = true;
+        if !self
+            .requested_output_expr
+            .iter()
+            .any(|OutputColumn { name, .. }| name == ROW_OFFSET)
+        {
+            self.requested_output_expr.push(OutputColumn {
+                expr: Expr::Column(Column::from_name(ROW_OFFSET)),
+                name: ROW_OFFSET.to_string(),
+            });
+        }
+    }
+
+    /// Check if the projection has any output columns
+    ///
+    /// This doesn't mean there is a physical projection.  For example, we may someday support
+    /// something like `SELECT 1 AS foo` which would have an output column (foo) but no physical projection
+    pub fn has_output_cols(&self) -> bool {
+        !self.requested_output_expr.is_empty()
     }
 
     pub fn output_schema(&self) -> Result<ArrowSchema> {
-        let exprs = self.to_physical_exprs()?;
+        let exprs = self.to_physical_exprs(&self.physical_projection.to_arrow_schema())?;
+        let physical_schema = self.physical_projection.to_arrow_schema();
         let fields = exprs
             .iter()
             .map(|(expr, name)| {
                 Ok(ArrowField::new(
                     name,
-                    expr.data_type(self.arrow_schema())?,
-                    expr.nullable(self.arrow_schema())?,
+                    expr.data_type(&physical_schema)?,
+                    expr.nullable(&physical_schema)?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -208,11 +302,8 @@ impl ProjectionPlan {
     }
 
     pub async fn project_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        if self.requested_output_expr.is_none() {
-            return Ok(batch);
-        }
         let src = Arc::new(OneShotExec::from_batch(batch));
-        let physical_exprs = self.to_physical_exprs()?;
+        let physical_exprs = self.to_physical_exprs(&self.physical_projection.to_arrow_schema())?;
         let projection = Arc::new(ProjectionExec::try_new(physical_exprs, src)?);
         let stream = execute_plan(projection, LanceExecutionOptions::default())?;
         let batches = stream.try_collect::<Vec<_>>().await?;
@@ -224,18 +315,5 @@ impl ProjectionPlan {
         } else {
             Ok(batches.into_iter().next().unwrap())
         }
-    }
-
-    pub fn project_stream(
-        &self,
-        stream: SendableRecordBatchStream,
-    ) -> Result<SendableRecordBatchStream> {
-        if self.requested_output_expr.is_none() {
-            return Ok(stream);
-        }
-        let src = Arc::new(OneShotExec::new(stream));
-        let physical_exprs = self.to_physical_exprs()?;
-        let projection = Arc::new(ProjectionExec::try_new(physical_exprs, src)?);
-        execute_plan(projection, LanceExecutionOptions::default())
     }
 }

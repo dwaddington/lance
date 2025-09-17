@@ -12,18 +12,18 @@
 //! sequences. The on-disk format is designed to align well with the in-memory
 //! representation, to avoid unnecessary deserialization.
 use std::ops::Range;
-
 // TODO: replace this with Arrow BooleanBuffer.
 
 // These are all internal data structures, and are private.
 mod bitmap;
 mod encoded_array;
 mod index;
-mod segment;
+pub mod segment;
 mod serde;
 
 use deepsize::DeepSizeOf;
 // These are the public API.
+pub use index::FragmentRowIdIndex;
 pub use index::RowIdIndex;
 use lance_core::{
     utils::mask::{RowIdMask, RowIdTreeMap},
@@ -34,9 +34,9 @@ pub use serde::{read_row_ids, write_row_ids};
 
 use snafu::location;
 
-use segment::U64Segment;
-
 use crate::utils::LanceIteratorExtension;
+use segment::U64Segment;
+use tracing::instrument;
 
 /// A sequence of row ids.
 ///
@@ -50,7 +50,7 @@ use crate::utils::LanceIteratorExtension;
 /// contiguous or sorted.
 ///
 /// We can make optimizations that assume uniqueness.
-#[derive(Debug, Clone, DeepSizeOf, PartialEq, Eq)]
+#[derive(Debug, Clone, DeepSizeOf, PartialEq, Eq, Default)]
 pub struct RowIdSequence(Vec<U64Segment>);
 
 impl std::fmt::Display for RowIdSequence {
@@ -95,7 +95,17 @@ impl From<Range<u64>> for RowIdSequence {
     }
 }
 
+impl From<&[u64]> for RowIdSequence {
+    fn from(row_ids: &[u64]) -> Self {
+        Self(vec![U64Segment::from_slice(row_ids)])
+    }
+}
+
 impl RowIdSequence {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = u64> + '_ {
         self.0.iter().flat_map(|segment| segment.iter())
     }
@@ -181,7 +191,7 @@ impl RowIdSequence {
             offset = cutoff;
         }
 
-        self.0.retain(|segment| segment.len() != 0);
+        self.0.retain(|segment| !segment.is_empty());
 
         Ok(())
     }
@@ -299,6 +309,44 @@ impl RowIdSequence {
         None
     }
 
+    /// Get row ids from the sequence based on the provided _sorted_ offsets
+    ///
+    /// Any out of bounds offsets will be ignored
+    ///
+    /// # Panics
+    ///
+    /// If the input selection is not sorted, this function will panic
+    pub fn select<'a>(
+        &'a self,
+        selection: impl Iterator<Item = usize> + 'a,
+    ) -> impl Iterator<Item = u64> + 'a {
+        let mut seg_iter = self.0.iter();
+        let mut cur_seg = seg_iter.next();
+        let mut rows_passed = 0;
+        let mut cur_seg_len = cur_seg.map(|seg| seg.len()).unwrap_or(0);
+        let mut last_index = 0;
+        selection.filter_map(move |index| {
+            if index < last_index {
+                panic!("Selection is not sorted");
+            }
+            last_index = index;
+
+            cur_seg?;
+
+            while (index - rows_passed) >= cur_seg_len {
+                rows_passed += cur_seg_len;
+                cur_seg = seg_iter.next();
+                if let Some(cur_seg) = cur_seg {
+                    cur_seg_len = cur_seg.len();
+                } else {
+                    return None;
+                }
+            }
+
+            Some(cur_seg.unwrap().get(index - rows_passed).unwrap())
+        })
+    }
+
     /// Given a mask of row ids, calculate the offset ranges of the row ids that are present
     /// in the sequence.
     ///
@@ -313,6 +361,7 @@ impl RowIdSequence {
     ///
     /// This function is useful when determining which row offsets to read from a fragment given
     /// a mask.
+    #[instrument(level = "debug", skip_all)]
     pub fn mask_to_offset_ranges(&self, mask: &RowIdMask) -> Vec<Range<u64>> {
         let mut offset = 0;
         let mut ranges = Vec::new();
@@ -513,13 +562,21 @@ impl RowIdSeqSlice<'_> {
 
 /// Re-chunk a sequences of row ids into chunks of a given size.
 ///
+/// The sequences may less than chunk sizes, because the sequences only
+/// contains the row ids that we want to keep, they come from the updates records.
+/// But the chunk sizes are based on the fragment physical rows(may contain inserted records).
+/// So if the sequences are smaller than the chunk sizes, we need to
+/// assign the incremental row ids in the further step. This behavior is controlled by the
+/// `allow_incomplete` parameter.
+///
 /// # Errors
 ///
-/// Will return an error if the sum of the chunk sizes is not equal to the total
-/// number of row ids in the sequences.
+/// If `allow_incomplete` is false, will return an error if the sum of the chunk sizes
+/// is not equal to the total number of row ids in the sequences.
 pub fn rechunk_sequences(
     sequences: impl IntoIterator<Item = RowIdSequence>,
     chunk_sizes: impl IntoIterator<Item = u64>,
+    allow_incomplete: bool,
 ) -> Result<Vec<RowIdSequence>> {
     // TODO: return an iterator. (with a good size hint?)
     let chunk_size_iter = chunk_sizes.into_iter();
@@ -558,9 +615,14 @@ pub fn rechunk_sequences(
                 }
                 (_, 0) => {
                     // Can push the entire segment.
-                    let segment = segment_iter.next().ok_or_else(too_many_segments_error)?;
-                    sequence.extend(RowIdSequence(vec![segment]));
-                    remaining = 0;
+                    if let Some(segment) = segment_iter.next() {
+                        sequence.extend(RowIdSequence(vec![segment]));
+                        remaining = 0;
+                    } else if allow_incomplete {
+                        remaining = 0;
+                    } else {
+                        return Err(too_many_segments_error());
+                    }
                 }
                 (_, _) => {
                     // Push remaining segment
@@ -772,7 +834,7 @@ mod test {
             chunk_sizes: Vec<u64>,
             expected: Vec<RowIdSequence>,
         ) {
-            let chunked = rechunk_sequences(input, chunk_sizes).unwrap();
+            let chunked = rechunk_sequences(input, chunk_sizes, false).unwrap();
             assert_eq!(chunked, expected);
         }
 
@@ -808,11 +870,11 @@ mod test {
         );
 
         // Too few segments -> error
-        let result = rechunk_sequences(many_segments.clone(), vec![100]);
+        let result = rechunk_sequences(many_segments.clone(), vec![100], false);
         assert!(result.is_err());
 
         // Too many segments -> error
-        let result = rechunk_sequences(many_segments, vec![5]);
+        let result = rechunk_sequences(many_segments, vec![5], false);
         assert!(result.is_err());
     }
 
@@ -991,6 +1053,30 @@ mod test {
         sequence.mask(0..sequence.len() as u32).unwrap();
         let expected = RowIdSequence(vec![]);
         assert_eq!(sequence, expected);
+    }
+
+    #[test]
+    fn test_selection() {
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::Range(10..15),
+            U64Segment::Range(20..25),
+        ]);
+        let selection = sequence.select(vec![2, 4, 13, 14, 57].into_iter());
+        assert_eq!(selection.collect::<Vec<_>>(), vec![2, 4, 23, 24]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_selection_unsorted() {
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::Range(10..15),
+            U64Segment::Range(20..25),
+        ]);
+        let _ = sequence
+            .select(vec![2, 4, 3].into_iter())
+            .collect::<Vec<_>>();
     }
 
     #[test]

@@ -36,7 +36,13 @@ from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
-    from .dataset import LanceDataset, LanceScanner, ReaderLike, Transaction
+    from .dataset import (
+        ColumnOrdering,
+        LanceDataset,
+        LanceScanner,
+        ReaderLike,
+        Transaction,
+    )
     from .lance import LanceSchema
 
 
@@ -155,6 +161,7 @@ class DataFile:
     file_major_version: int = 0
     file_minor_version: int = 0
     file_size_bytes: Optional[int] = None
+    base_id: Optional[int] = None
 
     def __init__(
         self,
@@ -164,6 +171,7 @@ class DataFile:
         file_major_version: int = 0,
         file_minor_version: int = 0,
         file_size_bytes: Optional[int] = None,
+        base_id: Optional[int] = None,
     ):
         # TODO: only we eliminate the path method, we can remove this
         self._path = path
@@ -172,6 +180,7 @@ class DataFile:
         self.file_major_version = file_major_version
         self.file_minor_version = file_minor_version
         self.file_size_bytes = file_size_bytes
+        self.base_id = base_id
 
     def __repr__(self):
         # pretend we have a 'path' attribute
@@ -405,6 +414,7 @@ class LanceFragment(pa.dataset.Fragment):
         with_row_id: bool = False,
         with_row_address: bool = False,
         batch_readahead: int = 16,
+        order_by: Optional[List[ColumnOrdering]] = None,
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
         filter_str = str(filter) if filter is not None else None
@@ -424,11 +434,34 @@ class LanceFragment(pa.dataset.Fragment):
             with_row_id=with_row_id,
             with_row_address=with_row_address,
             batch_readahead=batch_readahead,
+            order_by=order_by,
             **columns_arg,
         )
         from .dataset import LanceScanner
 
         return LanceScanner(s, self._ds)
+
+    def open_session(
+        self,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        with_row_address: Optional[bool] = None,
+    ) -> "FragmentSession":
+        """Open a FragmentSession, which manages a short-lived session of LanceFragment.
+         This API works well for users making repeated requests over the same columns.
+
+        Parameters
+        ----------
+        columns: list of str, or dict of str to str default None
+            List of column names to be fetched.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
+        with_row_address: enable returns with row addresses.
+
+        Returns
+        -------
+        session : FragmentSession
+        """
+        return FragmentSession(self._fragment.open_session(columns, with_row_address))
 
     def take(
         self,
@@ -446,7 +479,9 @@ class LanceFragment(pa.dataset.Fragment):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
+        with_row_address: bool = False,
         batch_readahead: int = 16,
+        order_by: Optional[List[ColumnOrdering]] = None,
     ) -> Iterator[pa.RecordBatch]:
         return self.scanner(
             columns=columns,
@@ -455,7 +490,9 @@ class LanceFragment(pa.dataset.Fragment):
             limit=limit,
             offset=offset,
             with_row_id=with_row_id,
+            with_row_address=with_row_address,
             batch_readahead=batch_readahead,
+            order_by=order_by,
         ).to_batches()
 
     def to_table(
@@ -465,6 +502,8 @@ class LanceFragment(pa.dataset.Fragment):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
+        with_row_address: bool = False,
+        order_by: Optional[List[ColumnOrdering]] = None,
     ) -> pa.Table:
         return self.scanner(
             columns=columns,
@@ -472,6 +511,8 @@ class LanceFragment(pa.dataset.Fragment):
             limit=limit,
             offset=offset,
             with_row_id=with_row_id,
+            with_row_address=with_row_address,
+            order_by=order_by,
         ).to_table()
 
     def merge(
@@ -690,7 +731,7 @@ if TYPE_CHECKING:
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        enable_move_stable_row_ids: bool = False,
+        enable_stable_row_ids: bool = False,
     ) -> Transaction: ...
 
     @overload
@@ -708,7 +749,7 @@ if TYPE_CHECKING:
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        enable_move_stable_row_ids: bool = False,
+        enable_stable_row_ids: bool = False,
     ) -> List[FragmentMetadata]: ...
 
 
@@ -726,7 +767,7 @@ def write_fragments(
     data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    enable_move_stable_row_ids: bool = False,
+    enable_stable_row_ids: bool = False,
 ) -> List[FragmentMetadata] | Transaction:
     """
     Write data into one or more fragments.
@@ -775,8 +816,8 @@ def write_fragments(
     storage_options : Optional[Dict[str, str]]
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
-    enable_move_stable_row_ids: bool
-        Experimental: if set to true, the writer will use move-stable row ids.
+    enable_stable_row_ids: bool
+        Experimental: if set to true, the writer will use stable row ids.
         These row ids are stable after compaction operations, but not after updates.
         This makes compaction more efficient, since with stable row ids no
         secondary indices need to be updated to point to new row ids.
@@ -827,5 +868,25 @@ def write_fragments(
         progress=progress,
         data_storage_version=data_storage_version,
         storage_options=storage_options,
-        enable_move_stable_row_ids=enable_move_stable_row_ids,
+        enable_stable_row_ids=enable_stable_row_ids,
     )
+
+
+class FragmentSession:
+    def __init__(self, session):
+        self._session = session
+
+    def take(self, indices):
+        """
+        Take rows from this fragment based on the offset in the fragment.
+
+        Parameters
+        ----------
+        indices : Array or array-like
+            indices of rows to select in the fragment.
+
+        Returns
+        -------
+        table : pyarrow.Table
+        """
+        return pa.Table.from_batches([self._session.take(indices)])

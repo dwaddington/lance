@@ -47,6 +47,7 @@ half.workspace = true
 itertools.workspace = true
 object_store = { workspace = true }
 aws-credential-types.workspace = true
+aws-credential-types.optional = true
 pin-project.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -77,9 +78,9 @@ prost_old = { version = "0.12.6", package = "prost", optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 tempfile.workspace = true
 tracing.workspace = true
-lazy_static = { workspace = true }
 humantime = { workspace = true }
 async_cell = "0.2.2"
+tokio-stream = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
@@ -102,19 +103,18 @@ env_logger = "0.11.7"
 test-log.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
-random_word = { version = "0.4.3", features = ["en"] }
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 
 
 [features]
-default = ["aws", "azure", "gcp"]
+default = ["aws", "azure", "gcp", "oss"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
-cli = ["clap", "lzma-sys/static"]
-tensorflow = ["tfrecord", "prost_old"]
-dynamodb = ["lance-table/dynamodb", "aws-sdk-dynamodb"]
+cli = ["dep:clap", "lzma-sys/static"]
+tensorflow = ["dep:tfrecord", "dep:prost_old"]
+dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 substrait = ["lance-datafusion/substrait"]
 protoc = [
@@ -123,9 +123,10 @@ protoc = [
     "lance-index/protoc",
     "lance-table/protoc",
 ]
-aws = ["lance-io/aws"]
+aws = ["lance-io/aws", "dep:aws-credential-types"]
 gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
+oss = ["lance-io/oss"]
 
 [[bin]]
 name = "lq"

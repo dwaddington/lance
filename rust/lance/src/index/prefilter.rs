@@ -62,7 +62,7 @@ impl DatasetPreFilter {
     ) -> Self {
         let mut fragments = RoaringBitmap::new();
         if indices.iter().any(|idx| idx.fragment_bitmap.is_none()) {
-            fragments.insert_range(0..dataset.manifest.max_fragment_id);
+            fragments.insert_range(0..dataset.manifest.max_fragment_id.unwrap_or(0));
         } else {
             indices.iter().for_each(|idx| {
                 fragments |= idx.fragment_bitmap.as_ref().unwrap();
@@ -137,14 +137,16 @@ impl DatasetPreFilter {
                 .await
         }
 
-        let cache_key = format!("row_id_mask/{}", dataset.manifest().version);
-
+        let dataset_clone = dataset.clone();
+        let key = crate::session::caches::RowIdMaskKey {
+            version: dataset.manifest().version,
+        };
         dataset
             .metadata_cache
-            .clone()
-            .get_or_insert(cache_key, move |_| {
+            .as_ref()
+            .get_or_insert_with_key(key, move || {
                 async move {
-                    let row_ids_and_deletions = load_row_ids_and_deletions(&dataset).await?;
+                    let row_ids_and_deletions = load_row_ids_and_deletions(&dataset_clone).await?;
 
                     // The process of computing the final mask is CPU-bound, so we spawn it
                     // on a blocking thread.
@@ -207,7 +209,7 @@ impl DatasetPreFilter {
         }
         if missing_frags.is_empty() && frags_with_deletion_files.is_empty() {
             None
-        } else if dataset.manifest.uses_move_stable_row_ids() {
+        } else if dataset.manifest.uses_stable_row_ids() {
             Some(Self::do_create_deletion_mask_row_id(dataset.clone()).boxed())
         } else {
             Some(
@@ -299,7 +301,7 @@ mod test {
             "memory://test",
             Some(WriteParams {
                 max_rows_per_file: 3,
-                enable_move_stable_row_ids: use_stable_row_id,
+                enable_stable_row_ids: use_stable_row_id,
                 ..Default::default()
             }),
         )

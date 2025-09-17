@@ -9,7 +9,6 @@ import platform
 import random
 import re
 import time
-import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import List
@@ -29,7 +28,7 @@ import pytest
 from helper import ProgressForTest
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
-from lance.dataset import AutoCleanupConfig
+from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
 from lance.debug import format_fragment
 from lance.schema import LanceSchema
 from lance.util import validate_vector_index
@@ -186,6 +185,7 @@ def test_to_batches_with_partial_last_batch(tmp_path: Path):
     all_batches = list(
         dataset.to_batches(batch_size=batch_size, strict_batch_size=True)
     )
+    print(all_batches)
     assert sum(b.num_rows for b in all_batches) == row_count_per_file * 3  # Total rows
     assert all(b.num_rows == batch_size for b in all_batches[:-1])  # Full batches
     assert all_batches[-1].num_rows == 1  # Final partial batch
@@ -322,9 +322,6 @@ def test_checkout(tmp_path: Path):
     assert ds1.version == 2
     assert ds1.to_table() == pa.table({"a": [0, 2]})
 
-    with pytest.raises(IOError):
-        ds2.delete("a = 2")
-
     ds1.delete("a = 2")
     assert ds1.count_rows() == 1
 
@@ -368,14 +365,12 @@ def test_asof_checkout(tmp_path: Path):
     assert len(ds.to_table()) == 9
 
 
-def test_enable_move_stable_row_ids(tmp_path: Path):
+def test_enable_stable_row_ids(tmp_path: Path):
     table = pa.Table.from_pylist(
         [{"name": "Alice", "age": 20}, {"name": "Bob", "age": 30}]
     )
-    lance.write_dataset(table, tmp_path, enable_move_stable_row_ids=True)
-    ds = lance.write_dataset(
-        table, tmp_path, enable_move_stable_row_ids=True, mode="append"
-    )
+    lance.write_dataset(table, tmp_path, enable_stable_row_ids=True)
+    ds = lance.write_dataset(table, tmp_path, enable_stable_row_ids=True, mode="append")
     table_before = ds.scanner(with_row_id=True, with_row_address=True).to_table()
     assert len(table_before) == 4
     assert table_before["_rowid"][0].as_py() == 0
@@ -677,7 +672,6 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
     dataset = dataset.checkout_version(full_ds_version)
     dataset.restore()
     dataset.delete("a > 2 AND a < 7")
-    print(dataset.to_table(offset=3, limit=1))
     filt_table = table.slice(7, 1)
 
     assert dataset.to_table(offset=3, limit=1) == filt_table
@@ -921,9 +915,9 @@ def test_analyze_filtered_scan(tmp_path: Path):
     base_dir = tmp_path / "test"
     ds = lance.write_dataset(table, base_dir)
     plan = ds.scanner(columns=[], filter="a < 50", with_row_id=True).analyze_plan()
-    print(plan)
-    assert re.search(r"^\s*LanceScan:.*output_rows=100.*$", plan, re.MULTILINE)
-    assert re.search(r"^\s*FilterExec:.*output_rows=50.*$", plan, re.MULTILINE)
+    assert re.search(
+        r"^\s*LanceRead:.*output_rows=50.*rows_scanned=100.*$", plan, re.MULTILINE
+    )
 
 
 def test_analyze_index_scan(tmp_path: Path):
@@ -931,9 +925,8 @@ def test_analyze_index_scan(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path)
     dataset.create_scalar_index("filter", "BTREE")
     plan = dataset.scanner(filter="filter = 10").analyze_plan()
-    assert (
-        "MaterializeIndex: query=[filter = 10]@filter_idx, metrics=[output_rows=1"
-        in plan
+    assert re.search(
+        r"^\s*LanceRead:.*output_rows=1.*rows_scanned=1.*$", plan, re.MULTILINE
     )
 
 
@@ -943,7 +936,9 @@ def test_analyze_scan(tmp_path: Path):
     plan = dataset.scanner().analyze_plan()
     # The bytes_read part might get brittle if we change file versions a lot
     # future us are free to ignore that part.
-    assert "bytes_read=3643, iops=3, requests=3" in plan
+    assert re.search(
+        r"^\s*LanceRead:.*bytes_read=3643.*iops=3.*requests=3.*$", plan, re.MULTILINE
+    )
 
 
 def test_analyze_take(tmp_path: Path):
@@ -951,7 +946,9 @@ def test_analyze_take(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path)
     dataset.create_scalar_index("a", "BTREE")
     plan = dataset.scanner(filter="a = 50").analyze_plan()
-    assert "bytes_read=16, iops=2, requests=2" in plan
+    assert re.search(
+        r"^\s*LanceRead:.*bytes_read=16.*iops=2.*requests=2.*$", plan, re.MULTILINE
+    )
 
 
 def test_analyze_vector_search(tmp_path: Path):
@@ -1225,6 +1222,24 @@ def test_create_from_commit(tmp_path: Path):
     assert tbl == table
 
 
+def test_strict_overwrite(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    operation = lance.LanceOperation.Overwrite(table.schema, [fragment])
+    dataset_v1 = lance.LanceDataset.commit(base_dir, operation, max_retries=0)
+    lance.LanceDataset.commit(
+        base_dir, operation, read_version=dataset_v1.version, max_retries=0
+    )
+    with pytest.raises(
+        OSError, match=f"Commit conflict for version {dataset_v1.version + 1}"
+    ):
+        lance.LanceDataset.commit(
+            base_dir, operation, read_version=dataset_v1.version, max_retries=0
+        )
+
+
 def test_append_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1399,6 +1414,93 @@ def test_merge_with_schema_holes(tmp_path: Path):
     assert tbl == expected
 
 
+def test_merge_columns_rowid(tmp_path: Path):
+    base_ds = lance.write_dataset(
+        pa.table({"a": range(10), "b": range(10)}), tmp_path / "base"
+    )
+
+    merged_frags = []
+    schema = None
+    for frag in base_ds.get_fragments():
+
+        def copy_row_id(batch: pa.RecordBatch) -> pa.RecordBatch:
+            return pa.record_batch(
+                {
+                    "row_id_copy": batch["_rowid"],
+                }
+            )
+
+        merged, new_schema = frag.merge_columns(copy_row_id, columns=["_rowid"])
+        merged_frags.append(merged)
+        schema = new_schema
+
+    merged_ds = lance.LanceDataset.commit(
+        base_ds.uri,
+        lance.LanceOperation.Merge(merged_frags, schema),
+        read_version=base_ds.version,
+    )
+
+    assert merged_ds.to_table() == pa.table(
+        {
+            "a": range(10),
+            "b": range(10),
+            "row_id_copy": pa.array(range(10), pa.uint64()),
+        }
+    )
+
+
+def test_merge_separate_dataset(tmp_path: Path):
+    base_ds = lance.write_dataset(
+        pa.table({"a": range(10), "b": range(10)}), tmp_path / "base"
+    )
+
+    def create_view():
+        for batch in base_ds.to_batches(columns=["a"], with_row_id=True):
+            new_batch = pa.record_batch(
+                {
+                    "original_row_id": batch["_rowid"],
+                    "double_a": pc.multiply(batch["a"], 2),
+                }
+            )
+            yield new_batch
+
+    schema = list(create_view())[0].schema
+
+    view_ds = lance.write_dataset(create_view(), tmp_path / "view", schema=schema)
+    view_ds.create_scalar_index("original_row_id", "BTREE")
+
+    merged_frags = []
+    schema = None
+    for frag in base_ds.get_fragments():
+        # TODO: It would be nice to use frag.merge_columns with a UDF, but if the UDF
+        # reads from another dataset, we will get a deadlock.
+        table = frag.to_table(with_row_id=True)
+        min_id = table["_rowid"][0]
+        max_id = table["_rowid"][-1]
+        view_table = view_ds.to_table(
+            columns=["double_a"],
+            filter=f"original_row_id >= {min_id} and original_row_id <= {max_id}",
+        )
+        if view_table.num_rows != table.num_rows:
+            raise ValueError(
+                f"Expected {table.num_rows} rows, got {view_table.num_rows}"
+            )
+
+        merged, new_schema = frag.merge_columns(view_table)
+        merged_frags.append(merged)
+        schema = new_schema
+
+    merged_ds = lance.LanceDataset.commit(
+        base_ds.uri,
+        lance.LanceOperation.Merge(merged_frags, schema),
+        read_version=base_ds.version,
+    )
+
+    assert merged_ds.to_table() == pa.table(
+        {"a": range(10), "b": range(10), "double_a": range(0, 20, 2)}
+    )
+
+
 def test_merge_search(tmp_path: Path):
     left_table = pa.Table.from_pydict({"id": [1, 2, 3], "left": ["a", "b", "c"]})
     right_table = pa.Table.from_pydict({"id": [1, 2, 3], "right": ["A", "B", "C"]})
@@ -1427,10 +1529,17 @@ def test_data_files(tmp_path: Path):
 
     data_files = fragment.files
     assert len(data_files) == 1
-    # it is a valid uuid
+    # Filename should be in format: 24-bit binary prefix + 26 hex chars
     with pytest.warns(DeprecationWarning):
         path = data_files[0].path()
-    uuid.UUID(os.path.splitext(path)[0])
+    filename_without_ext = os.path.splitext(path)[0]
+
+    # Should be 50 characters: 24 binary + 26 hex
+    assert len(filename_without_ext) == 50
+    # First 24 should be binary (0s and 1s)
+    assert all(c in "01" for c in filename_without_ext[:24])
+    # Last 26 should be hex
+    assert all(c in "0123456789abcdef" for c in filename_without_ext[24:])
 
     assert fragment.deletion_file is None
 
@@ -2062,6 +2171,111 @@ def test_merge_insert_empty_index():
     empty_ds.merge_insert("id").when_not_matched_insert_all().execute(df)
 
 
+def test_merge_insert_explain_analyze_plan():
+    """Test that explain_plan and analyze_plan work on merge insert operations."""
+    # Create a simple test dataset
+    data = pa.table(
+        [pa.array([1, 2, 3, 4]), pa.array(["a", "b", "c", "d"])], names=["id", "value"]
+    )
+
+    dataset = lance.write_dataset(data, "memory://test-merge-explain")
+
+    # Create merge insert builder
+    builder = (
+        dataset.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+    )
+
+    # Test explain_plan with default schema (None)
+    plan = builder.explain_plan()  # Uses dataset schema by default
+    assert isinstance(plan, str)
+    assert len(plan) > 0
+    assert "MergeInsert" in plan
+
+    # Test with explicit schema (must match dataset schema exactly)
+    source_schema = pa.schema(
+        [pa.field("id", pa.int64()), pa.field("value", pa.string())]
+    )
+    plan_explicit = builder.explain_plan(source_schema, verbose=False)
+    assert isinstance(plan_explicit, str)
+    assert len(plan_explicit) > 0
+    assert "MergeInsert" in plan_explicit
+
+    # Test verbose mode with default schema
+    plan_verbose = builder.explain_plan(verbose=True)
+    assert isinstance(plan_verbose, str)
+    assert len(plan_verbose) > 0
+    assert "MergeInsert" in plan_verbose
+
+    # Create test source data for analyze_plan (must match dataset schema exactly)
+    source_data = pa.table(
+        [
+            pa.array([1, 5]),  # 1 matches existing, 5 is new
+            pa.array(["updated_a", "e"]),
+        ],
+        names=["id", "value"],
+    )
+
+    # Test analyze_plan
+    analysis = builder.analyze_plan(source_data)
+    assert isinstance(analysis, str)
+    assert len(analysis) > 0
+    assert "MergeInsert" in analysis
+    assert "metrics" in analysis
+    # Check for new write metrics
+    assert "bytes_written" in analysis
+    assert "num_files_written" in analysis
+
+
+def test_merge_insert_use_index():
+    """Test that use_index parameter controls whether indices are used."""
+    data = pa.table({"id": range(100), "value": [i * 10 for i in range(100)]})
+    dataset = lance.write_dataset(data, "memory://test-merge-use-index")
+    dataset.create_scalar_index("id", "BTREE")
+
+    source_data = pa.table({"id": [1, 2, 101], "value": [999, 999, 999]})
+
+    # Test 1: use_index=False should allow explain_plan to succeed
+    builder_no_index = (
+        dataset.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .use_index(False)  # Force not using index
+    )
+
+    # With use_index=False, explain_plan should succeed even with an index present
+    plan = builder_no_index.explain_plan()
+    assert isinstance(plan, str)
+    assert "MergeInsert" in plan
+    # Should use hash join, not index scan
+    assert "HashJoinExec" in plan or "Join" in plan
+
+    # Test 2: use_index=True (default) should fail explain_plan with index present
+    builder_with_index = (
+        dataset.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .use_index(True)  # Explicitly set to use index (though it's the default)
+    )
+
+    # With use_index=True and an index present, explain_plan should fail
+    with pytest.raises(Exception) as exc_info:
+        builder_with_index.explain_plan()
+    assert "does not support explain_plan" in str(exc_info.value)
+
+    # Test 3: Verify actual execution works with no index
+    result = builder_no_index.execute(source_data)
+    assert result["num_updated_rows"] == 2
+    assert result["num_inserted_rows"] == 1
+
+    # Verify the data was updated correctly
+    updated_table = dataset.to_table()
+    values = updated_table.column("value").to_pylist()
+    updated_count = sum(1 for v in values if v == 999)
+    assert updated_count == 3
+
+
 def test_add_null_columns(tmp_path: Path):
     data = pa.table({"id": [1, 2, 4]})
     ds = lance.write_dataset(data, tmp_path)
@@ -2281,6 +2495,24 @@ def test_create_update_empty_dataset(tmp_path: Path, provide_pandas: bool):
     assert dataset.to_table() == pa.table(
         {"a": ["foo"], "b": [1], "c": [2.0]}, schema=expected_schema
     )
+
+
+def test_update_with_retry_parameters(tmp_path: Path):
+    """Test that update accepts conflict_retries and retry_timeout parameters"""
+    nrows = 10
+    tab = pa.table({"a": range(nrows), "b": range(nrows)})
+    lance.write_dataset(tab, tmp_path / "dataset", mode="append")
+
+    dataset = lance.dataset(tmp_path / "dataset")
+
+    # Test with custom conflict_retries and retry_timeout
+    update_dict = dataset.update(
+        updates=dict(b="b + 1"), conflict_retries=5, retry_timeout=timedelta(seconds=60)
+    )
+
+    expected = pa.table({"a": range(10), "b": range(1, 11)})
+    assert dataset.to_table(columns=["a", "b"]) == expected
+    check_update_stats(update_dict, (10,))
 
 
 def test_scan_with_batch_size(tmp_path: Path):
@@ -2629,9 +2861,12 @@ def test_scan_no_columns(tmp_path: Path):
     for batch in batches:
         assert batch.schema == expected_schema
 
-    # if with_row_id is not True then columns=[] is an error
-    with pytest.raises(ValueError, match="no columns were selected"):
-        dataset.scanner(columns=[]).to_table()
+    # Can specify nothing at all to get empty batches (with correct counts)
+    batches = list(dataset.scanner(columns=[], batch_size=10).to_batches())
+    assert len(batches) == 10
+    for batch in batches:
+        assert batch.schema.names == []
+        assert batch.num_rows == 10
 
     # also test with deleted data to make sure deleted ids not included
     dataset.delete("a = 5")
@@ -2690,6 +2925,97 @@ def test_scan_count_rows(tmp_path: Path):
     assert dataset.count_rows(filter=pa_ds.field("a") < 20) == 20
 
 
+def test_with_row_offset(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    df = pd.DataFrame({"a": range(100)})
+    dataset = lance.write_dataset(df, base_dir, max_rows_per_file=25)
+
+    tbl = dataset.scanner(columns=["_rowoffset"]).to_table()
+    tbl = tbl.combine_chunks()
+    assert tbl == pa.table({"_rowoffset": pa.array(range(100), pa.uint64())})
+
+
+def test_system_columns(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    df = pd.DataFrame({"a": range(100)})
+    dataset = lance.write_dataset(df, base_dir, max_rows_per_file=25)
+
+    # Projection order is respected when system columns are specified via projection
+    tbl = dataset.scanner(columns=["_rowid", "_rowaddr", "_rowoffset"]).to_table()
+    assert tbl.schema.names == ["_rowid", "_rowaddr", "_rowoffset"]
+    tbl = dataset.scanner(columns=["_rowoffset", "_rowid", "_rowaddr"]).to_table()
+    assert tbl.schema.names == ["_rowoffset", "_rowid", "_rowaddr"]
+
+    # If specified using with_row_id or with_row_address, the system columns are
+    # added to the end of the schema
+    tbl = dataset.scanner(with_row_id=True).to_table()
+    assert tbl.schema.names == ["a", "_rowid"]
+    tbl = dataset.scanner(with_row_address=True).to_table()
+    assert tbl.schema.names == ["a", "_rowaddr"]
+    tbl = dataset.scanner(with_row_address=True, with_row_id=True).to_table()
+    assert tbl.schema.names == ["a", "_rowid", "_rowaddr"]
+
+
+def test_scoring_columns(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    df = pa.table(
+        {
+            "vec": pa.array([[i, i] for i in range(100)], pa.list_(pa.float32(), 2)),
+        }
+    )
+    dataset = lance.write_dataset(df, base_dir)
+
+    nearest = {
+        "column": "vec",
+        "q": pa.array([1, 1], pa.float32()),
+        "k": 10,
+        "use_index": False,
+    }
+
+    # Common behavior, no projection means we add distance column at the end
+    print(dataset.scanner(nearest=nearest).explain_plan())
+    tbl = dataset.scanner(nearest=nearest).to_table()
+    assert tbl.schema.names == ["vec", "_distance"]
+
+    # If _rowid or _rowaddr specified via legacy means, they go after distance
+    tbl = dataset.scanner(nearest=nearest, with_row_id=True).to_table()
+    assert tbl.schema.names == ["vec", "_distance", "_rowid"]
+
+    tbl = dataset.scanner(nearest=nearest, with_row_address=True).to_table()
+    assert tbl.schema.names == ["vec", "_distance", "_rowaddr"]
+
+    tbl = dataset.scanner(
+        nearest=nearest, with_row_address=True, with_row_id=True
+    ).to_table()
+    assert tbl.schema.names == ["vec", "_distance", "_rowid", "_rowaddr"]
+
+    # If _rowid or _rowaddr are specified via projection, they stay in the specified
+    # order
+    tbl = dataset.scanner(
+        columns=["_rowid", "vec"], nearest=nearest, disable_scoring_autoprojection=False
+    ).to_table()
+    assert tbl.schema.names == ["_rowid", "vec", "_distance"]
+    tbl = dataset.scanner(
+        columns=["vec", "_rowaddr"],
+        nearest=nearest,
+        disable_scoring_autoprojection=False,
+    ).to_table()
+    assert tbl.schema.names == ["vec", "_rowaddr", "_distance"]
+
+    # Legacy behavior
+    # Even though projection happens, the distance column is still added to the end
+    tbl = dataset.scanner(
+        columns=["vec"], nearest=nearest, disable_scoring_autoprojection=False
+    ).to_table()
+    assert tbl.schema.names == ["vec", "_distance"]
+
+    # If we disable scoring autoprojection, the distance column is not added
+    tbl = dataset.scanner(
+        columns=["vec"], nearest=nearest, disable_scoring_autoprojection=True
+    ).to_table()
+    assert tbl.schema.names == ["vec"]
+
+
 def test_scanner_schemas(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     df = pd.DataFrame({"a": range(50), "s": [f"s-{i}" for i in range(50)]})
@@ -2730,10 +3056,12 @@ def test_scan_deleted_rows(tmp_path: Path):
         == 7
     )
 
-    with pytest.raises(ValueError, match="Cannot include deleted rows"):
-        ds.scanner(
-            include_deleted_rows=True, with_row_id=True, filter="b < 30"
-        ).to_table()
+    assert (
+        ds.scanner(include_deleted_rows=True, with_row_id=True, filter="b < 30")
+        .to_table()
+        .num_rows
+        == 5
+    )
 
     with pytest.raises(ValueError, match="with_row_id is false"):
         ds.scanner(include_deleted_rows=True, filter="a < 30").to_table()
@@ -3307,13 +3635,15 @@ def test_use_scalar_index(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path)
     dataset.create_scalar_index("filter", "BTREE")
 
-    assert "MaterializeIndex" in dataset.scanner(filter="filter = 10").explain_plan(
-        True
-    )
-    assert "MaterializeIndex" in dataset.scanner(
+    assert "ScalarIndexQuery: query=[filter = 10]@filter_idx" in dataset.scanner(
+        filter="filter = 10"
+    ).explain_plan(True)
+
+    assert "ScalarIndexQuery: query=[filter = 10]@filter_idx" in dataset.scanner(
         filter="filter = 10", use_scalar_index=True
     ).explain_plan(True)
-    assert "MaterializeIndex" not in dataset.scanner(
+
+    assert "ScalarIndexQuery" not in dataset.scanner(
         filter="filter = 10", use_scalar_index=False
     ).explain_plan(True)
 
@@ -3429,6 +3759,11 @@ def test_dataset_drop(tmp_path: Path):
     assert Path(tmp_path).exists()
     lance.LanceDataset.drop(tmp_path)
     assert not Path(tmp_path).exists()
+    lance.LanceDataset.drop(tmp_path, ignore_not_found=True)
+    with pytest.raises(OSError):
+        lance.LanceDataset.drop(tmp_path, ignore_not_found=False)
+    with pytest.raises(OSError):
+        lance.LanceDataset.drop(tmp_path)
 
 
 def test_dataset_schema(tmp_path: Path):
@@ -3578,3 +3913,260 @@ def test_metadata_cache_size(tmp_path):
     # With zero cache size, session should be smaller than default
     # (it won't be exactly 0 due to struct overhead)
     assert zero_cache_size < default_size
+
+
+def test_dataset_sql(tmp_path: Path):
+    table = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
+    ds = lance.write_dataset(table, tmp_path / "test")
+
+    query = ds.sql("SELECT * FROM test WHERE id > 1").table_name("test").build()
+
+    result = query.to_batch_records()
+    expected = pa.table({"id": [2, 3], "value": ["b", "c"]})
+    assert pa.Table.from_batches(result) == expected
+
+    stream_result = (
+        ds.sql("SELECT value FROM test WHERE id = 1")
+        .table_name("test")
+        .build()
+        .to_stream_reader()
+    )
+    batches = list(stream_result)
+    assert len(batches) == 1
+    assert batches[0].to_pydict() == {"value": ["a"]}
+
+    complex_query = ds.sql("""
+                           SELECT id as user_id, UPPER(value) as val
+                           FROM dataset
+                           WHERE id BETWEEN 1 AND 3
+                           """).build()
+    complex_result = complex_query.to_batch_records()
+    expected_complex = pa.table({"user_id": [1, 2, 3], "val": ["A", "B", "C"]})
+    assert pa.Table.from_batches(complex_result) == expected_complex
+
+
+def test_file_reader_options(tmp_path: Path):
+    """Test cache_repetition_index and validate_on_decode options"""
+    # Create a dataset with large repetitive strings to test cache_repetition_index
+    # Using large strings to ensure repetition index is used
+    large_string = "x" * 1000
+    table = pa.table(
+        {
+            "id": range(10000),
+            "text": [large_string] * 10000,  # Highly repetitive column
+            "unique": [f"unique_{i}" for i in range(10000)],  # Non-repetitive column
+        }
+    )
+    lance.write_dataset(table, tmp_path / "test")
+
+    # Test cache_repetition_index reduces I/O operations
+    # First read without cache
+    dataset_no_cache = lance.dataset(
+        tmp_path / "test", read_params={"cache_repetition_index": False}
+    )
+    iops_before = lance.iops_counter()
+    result1 = dataset_no_cache.scanner(columns=["text"]).to_table()
+    iops_without_cache = lance.iops_counter() - iops_before
+    assert result1.num_rows == 10000
+
+    # Second read with cache enabled
+    dataset_with_cache = lance.dataset(
+        tmp_path / "test", read_params={"cache_repetition_index": True}
+    )
+    iops_before = lance.iops_counter()
+    result2 = dataset_with_cache.scanner(columns=["text"]).to_table()
+    iops_with_cache = lance.iops_counter() - iops_before
+    assert result2.num_rows == 10000
+
+    # With cache, we should see fewer I/O operations for repetitive data
+    # The difference might be small for small datasets, but should be measurable
+    assert iops_with_cache <= iops_without_cache
+
+    # Test validate_on_decode option
+    # For now just verify it doesn't break normal operation
+    dataset_validate = lance.dataset(
+        tmp_path / "test", read_params={"validate_on_decode": True}
+    )
+    result3 = dataset_validate.to_table()
+    assert result3.num_rows == 10000
+
+    # Test both options together
+    dataset_both = lance.dataset(
+        tmp_path / "test",
+        read_params={"cache_repetition_index": True, "validate_on_decode": False},
+    )
+    result4 = dataset_both.to_table()
+    assert result4.num_rows == 10000
+
+    # Test that scanner inherits options from dataset
+    dataset_inherit = lance.dataset(
+        tmp_path / "test",
+        read_params={"cache_repetition_index": True, "validate_on_decode": True},
+    )
+    scanner = dataset_inherit.scanner()
+    result5 = scanner.to_table()
+    assert result5.num_rows == 10000
+
+    # Verify the scanner is using the same options by checking I/O pattern
+    iops_before = lance.iops_counter()
+    scanner2 = dataset_inherit.scanner(columns=["text"])
+    result6 = scanner2.to_table()
+    assert result6.num_rows == 10000
+    iops_scanner = lance.iops_counter() - iops_before
+
+    # Scanner with inherited cache option should have similar I/O pattern as
+    # direct dataset read
+    assert iops_scanner <= iops_without_cache
+
+
+def test_read_transaction_properties(tmp_path):
+    """Test retrieving properties from transactions at different versions."""
+    # Create schema and data for the dataset
+    schema = pa.schema([pa.field("id", pa.int32()), pa.field("value", pa.string())])
+
+    # First batch with properties
+    batch1 = pa.RecordBatch.from_arrays(
+        [pa.array([1, 2, 3]), pa.array(["a", "b", "c"])], schema=schema
+    )
+
+    # Create the first version with properties
+    properties1 = {
+        LANCE_COMMIT_MESSAGE_KEY: "First commit",
+        "custom_prop": "custom_value",
+    }
+
+    dataset = lance.write_dataset(batch1, tmp_path, transaction_properties=properties1)
+    mytrans = dataset.read_transaction(1)
+    print(mytrans)
+
+    # Test retrieving properties from the first version
+    transaction = dataset.read_transaction(1)
+    props = transaction.transaction_properties
+    assert props.get(LANCE_COMMIT_MESSAGE_KEY) == "First commit"
+    assert props.get("custom_prop") == "custom_value"
+
+    # Create a second batch with different properties
+    batch2 = pa.RecordBatch.from_arrays(
+        [pa.array([4, 5]), pa.array(["d", "e"])], schema=schema
+    )
+
+    # Add the second batch with different properties
+    properties2 = {
+        LANCE_COMMIT_MESSAGE_KEY: "Second commit",
+        "another_prop": "another_value",
+    }
+
+    dataset = lance.write_dataset(
+        batch2, tmp_path, mode="append", transaction_properties=properties2
+    )
+
+    # Test retrieving properties from the second version
+    transaction = dataset.read_transaction(2)
+    props = transaction.transaction_properties
+    assert props.get(LANCE_COMMIT_MESSAGE_KEY) == "Second commit"
+    assert props.get("another_prop") == "another_value"
+
+    # Test retrieving properties from the first version again
+    # to ensure old versions' properties are still accessible
+    transaction = dataset.read_transaction(1)
+    props = transaction.transaction_properties
+    assert props.get(LANCE_COMMIT_MESSAGE_KEY) == "First commit"
+    assert props.get("custom_prop") == "custom_value"
+
+
+def test_get_properties_with_no_properties(tmp_path):
+    """Test retrieving properties when none were set."""
+    # Create a test dataset without properties
+
+    # Create schema and data for the dataset
+    schema = pa.schema([pa.field("id", pa.int32())])
+    batch = pa.RecordBatch.from_arrays([pa.array([1, 2, 3])], schema=schema)
+
+    # Create the dataset without properties
+    dataset = lance.write_dataset(batch, tmp_path)
+
+    # Test retrieving properties - should return None
+    transaction = dataset.read_transaction(1)
+    assert transaction.transaction_properties == {}
+
+
+def test_commit_message_and_get_properties(tmp_path):
+    """Test accessing commit messages via get_transactions."""
+    table = pa.table({"a": [1]})
+
+    # 1. Test case: Commit with a message
+    dataset = lance.write_dataset(table, tmp_path, commit_message="first commit")
+    transactions = dataset.get_transactions()
+    assert len(transactions) == 1
+    assert (
+        transactions[0].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
+        == "first commit"
+    )
+    # 2. Test case: Commit without a message
+    lance.write_dataset(table, tmp_path, mode="append")
+    dataset = lance.dataset(tmp_path)
+    transactions = dataset.get_transactions()
+    # Transactions are listed in reverse chronological order
+    assert len(transactions) == 2
+    # The latest transaction has no message,
+    # so the key should be missing or properties is None
+    assert (
+        transactions[0].transaction_properties == {}
+        or LANCE_COMMIT_MESSAGE_KEY not in transactions[0].transaction_properties
+    )
+    # The first transaction should still have the message
+    assert (
+        transactions[1].transaction_properties.get(LANCE_COMMIT_MESSAGE_KEY)
+        == "first commit"
+    )
+    # 3. Test case: Transaction with no properties at all
+    # A delete operation creates a new version that may have no properties.
+    dataset.delete("a > 100")  # A no-op delete
+    transactions = dataset.get_transactions()
+    assert len(transactions) == 3
+    # The latest transaction from delete should have no properties.
+    assert transactions[0].transaction_properties == {}
+
+
+def test_diff_meta(tmp_path: Path):
+    table1 = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
+    lance.write_dataset(table1, tmp_path)
+
+    table2 = pa.table({"id": [4, 5], "value": ["d", "e"]})
+    dataset = lance.write_dataset(
+        table2, tmp_path, mode="append", commit_message="Append data"
+    )
+
+    dataset.delete("id = 2")
+
+    diff = dataset.diff_meta(1)
+
+    assert len(diff) == 2
+
+    for transaction in diff:
+        assert hasattr(transaction, "read_version")
+        assert hasattr(transaction, "transaction_properties")
+
+    dataset_v2 = lance.dataset(tmp_path, version=2)
+    diff_v2 = dataset_v2.diff_meta(1)
+
+    assert len(diff_v2) == 1
+
+    # Test diff with current version (should raise error)
+    with pytest.raises(ValueError):
+        dataset.diff_meta(dataset.version)
+
+    # Test diff with future version (should raise error)
+    with pytest.raises(ValueError):
+        dataset.diff_meta(dataset.version + 1)
+
+    # Test diff with non-existent version after cleanup
+    moment = datetime.now()
+    table3 = pa.table({"id": [6, 7], "value": ["f", "g"]})
+    dataset = lance.write_dataset(table3, tmp_path, mode="append")
+
+    dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+
+    # Now try to diff with the cleaned up version 1 (should raise error)
+    with pytest.raises(ValueError):
+        dataset.diff_meta(1)

@@ -511,7 +511,7 @@ impl IvfShuffler {
                 let file = scheduler
                     .open_file(&path, &CachedFileSize::unknown())
                     .await?;
-                let cache = LanceCache::with_capacity(128 * 1024 * 1024);
+                let cache = lance_core::cache::LanceCache::with_capacity(128 * 1024 * 1024);
 
                 let reader = Lancev2FileReader::try_open(
                     file,
@@ -670,10 +670,14 @@ impl IvfShuffler {
                 }
                 num_processed += 1;
 
-                let batch = batch?;
+                let mut batch = batch?;
 
                 if batch.num_rows() == 0 {
                     continue;
+                }
+
+                if let Some((row_id_idx, _)) = batch.schema().column_with_name("row_id") {
+                    batch = batch.rename_column(row_id_idx, ROW_ID)?;
                 }
 
                 let part_ids: &UInt32Array = batch[PART_ID_COLUMN].as_primitive();
@@ -1115,7 +1119,7 @@ mod test {
         let schema2 = schema.clone();
 
         let stream = stream::iter(0..num_batches).map(move |idx| {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let row_ids = Arc::new(UInt64Array::from_iter(
                 (idx * 1024..(idx + 1) * 1024).map(u64::from),
             ));

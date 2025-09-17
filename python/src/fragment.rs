@@ -21,6 +21,7 @@ use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
+use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform};
 use lance::Error;
@@ -140,6 +141,34 @@ impl FileFragment {
         })
     }
 
+    #[pyo3(signature=(columns=None, with_row_address=None))]
+    fn open_session(
+        self_: PyRef<'_, Self>,
+        columns: Option<Vec<String>>,
+        with_row_address: Option<bool>,
+    ) -> PyResult<FragmentSession> {
+        let dataset_schema = self_.fragment.dataset().schema();
+        let projection = if let Some(columns) = columns {
+            dataset_schema
+                .project(&columns)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?
+        } else {
+            dataset_schema.clone()
+        };
+
+        let fragment = self_.fragment.clone();
+        let session = RT
+            .spawn(Some(self_.py()), async move {
+                fragment
+                    .open_session(&projection, with_row_address.unwrap_or(false))
+                    .await
+            })?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(FragmentSession {
+            session: Arc::new(session),
+        })
+    }
+
     #[pyo3(signature=(row_indices, columns=None))]
     fn take(
         self_: PyRef<'_, Self>,
@@ -166,7 +195,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, order_by=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -178,6 +207,7 @@ impl FileFragment {
         with_row_id: Option<bool>,
         with_row_address: Option<bool>,
         batch_readahead: Option<usize>,
+        order_by: Option<Vec<PyLance<ColumnOrdering>>>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
 
@@ -222,7 +252,12 @@ impl FileFragment {
         if let Some(batch_readahead) = batch_readahead {
             scanner.batch_readahead(batch_readahead);
         }
-
+        if let Some(orderings) = order_by {
+            let col_orderings = Some(orderings.into_iter().map(|co| co.0).collect());
+            scanner
+                .order_by(col_orderings)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
         let scn = Arc::new(scanner);
         Ok(Scanner::new(scn))
     }
@@ -426,7 +461,13 @@ pub struct PyDeletionFile(pub DeletionFile);
 #[pymethods]
 impl PyDeletionFile {
     #[new]
-    fn new(read_version: u64, id: u64, file_type: &str, num_deleted_rows: usize) -> PyResult<Self> {
+    fn new(
+        read_version: u64,
+        id: u64,
+        file_type: &str,
+        num_deleted_rows: usize,
+        base_id: Option<u32>,
+    ) -> PyResult<Self> {
         let file_type = match file_type {
             "array" => DeletionFileType::Array,
             "bitmap" => DeletionFileType::Bitmap,
@@ -442,6 +483,7 @@ impl PyDeletionFile {
             id,
             file_type,
             num_deleted_rows: Some(num_deleted_rows),
+            base_id,
         }))
     }
 
@@ -455,6 +497,7 @@ impl PyDeletionFile {
             intern!(slf.py(), "num_deleted_rows"),
             slf.0.num_deleted_rows,
         )?;
+        dict.set_item(intern!(slf.py(), "base_id"), slf.0.base_id)?;
 
         Ok(dict)
     }
@@ -490,6 +533,11 @@ impl PyDeletionFile {
             DeletionFileType::Array => "array",
             DeletionFileType::Bitmap => "bitmap",
         }
+    }
+
+    #[getter]
+    fn base_id(&self) -> &Option<u32> {
+        &self.0.base_id
     }
 
     #[pyo3(signature = (fragment_id, base_uri=None))]
@@ -591,6 +639,27 @@ impl PyRowIdMeta {
     }
 }
 
+#[pyclass(name = "FragmentSession", module = "_lib", subclass)]
+#[derive(Clone)]
+pub struct FragmentSession {
+    session: Arc<lance::dataset::fragment::session::FragmentSession>,
+}
+
+#[pymethods]
+impl FragmentSession {
+    #[pyo3(signature=(indices))]
+    pub fn take(self_: PyRef<'_, Self>, indices: Vec<u32>) -> PyResult<PyObject> {
+        let session = self_.session.clone();
+        let batch = RT
+            .spawn(
+                Some(self_.py()),
+                async move { session.take(&indices).await },
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        batch.to_pyarrow(self_.py())
+    }
+}
+
 impl FromPyObject<'_> for PyLance<Fragment> {
     fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
         let files = extract_vec(&ob.getattr("files")?)?;
@@ -662,6 +731,7 @@ impl FromPyObject<'_> for PyLance<DataFile> {
             file_major_version: ob.getattr("file_major_version")?.extract()?,
             file_minor_version: ob.getattr("file_minor_version")?.extract()?,
             file_size_bytes,
+            base_id: ob.getattr("base_id")?.extract()?,
         }))
     }
 }
@@ -685,6 +755,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
             self.0.file_major_version,
             self.0.file_minor_version,
             file_size_bytes,
+            self.0.base_id,
         ))
     }
 }

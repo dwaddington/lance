@@ -12,10 +12,10 @@ use futures::StreamExt;
 use lance_core::utils::tracing::StreamTracingExt;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOpts, PutOptions,
-    PutPayload, PutResult, Result as OSResult, UploadPart,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+    PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
 };
-use tracing::{debug_span, instrument, Span};
+use tracing::{debug_span, instrument, Instrument, Span};
 
 #[derive(Debug)]
 pub struct TracedMultipartUpload {
@@ -28,10 +28,7 @@ impl MultipartUpload for TracedMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let write_span = self.write_span.clone();
         let fut = self.target.put_part(data);
-        Box::pin(async move {
-            let _guard = write_span.enter();
-            fut.await
-        })
+        Box::pin(fut.instrument(write_span))
     }
 
     #[instrument(level = "debug")]
@@ -88,7 +85,7 @@ impl object_store::ObjectStore for TracedObjectStore {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> OSResult<Box<dyn object_store::MultipartUpload>> {
         let upload = self.target.put_multipart_opts(location, opts).await?;
         Ok(Box::new(TracedMultipartUpload {

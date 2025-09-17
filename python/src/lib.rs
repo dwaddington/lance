@@ -23,7 +23,9 @@
 #![allow(clippy::useless_conversion)]
 
 use std::env;
-use std::sync::Arc;
+use std::fs::OpenOptions;
+use std::path::Path;
+use std::sync::{Arc, LazyLock};
 
 use std::ffi::CString;
 
@@ -59,9 +61,6 @@ use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
 use scanner::ScanStatistics;
 use session::Session;
 
-#[macro_use]
-extern crate lazy_static;
-
 pub(crate) mod arrow;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
@@ -81,7 +80,9 @@ pub(crate) mod transaction;
 pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
+use crate::file::LanceFileSession;
 use crate::fragment::{write_fragments, write_fragments_transaction};
+use crate::tracing::{capture_trace_events, shutdown_tracing, PyTraceEvent};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
@@ -93,6 +94,8 @@ pub use reader::LanceReader;
 pub use scanner::Scanner;
 
 use crate::executor::BackgroundExecutor;
+
+const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(not(feature = "datagen"))]
 #[pyfunction]
@@ -110,9 +113,7 @@ fn register_datagen(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 // TODO: make this runtime configurable (e.g. num threads)
-lazy_static! {
-    static ref RT: BackgroundExecutor = BackgroundExecutor::new();
-}
+static RT: LazyLock<BackgroundExecutor> = LazyLock::new(BackgroundExecutor::new);
 
 pub fn init_logging(mut log_builder: Builder) {
     let logger = log_builder.build();
@@ -126,12 +127,70 @@ pub fn init_logging(mut log_builder: Builder) {
     log::set_max_level(max_level);
 }
 
+fn set_timestamp_precision(builder: &mut env_logger::Builder) {
+    if let Ok(timestamp_precision) = env::var("LANCE_LOG_TS_PRECISION") {
+        match timestamp_precision.as_str() {
+            "ns" => {
+                builder.format_timestamp_nanos();
+            }
+            "us" => {
+                builder.format_timestamp_micros();
+            }
+            "ms" => {
+                builder.format_timestamp_millis();
+            }
+            "s" => {
+                builder.format_timestamp_secs();
+            }
+            _ => {
+                // Can't log here because logging is not initialized yet
+                println!(
+                    "Invalid timestamp precision (valid values: ns, us, ms, s): {}, using default",
+                    timestamp_precision
+                );
+            }
+        };
+    }
+}
+
+fn set_log_file_target(builder: &mut env_logger::Builder) {
+    if let Ok(log_file_path) = env::var("LANCE_LOG_FILE") {
+        let path = Path::new(&log_file_path);
+
+        // Create parent directories if they don't exist
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                println!(
+                    "Failed to create parent directories for log file '{}': {}, using stderr",
+                    log_file_path, e
+                );
+                return;
+            }
+        }
+
+        // Try to open/create the log file
+        match OpenOptions::new().create(true).append(true).open(path) {
+            Ok(file) => {
+                builder.target(env_logger::Target::Pipe(Box::new(file)));
+            }
+            Err(e) => {
+                println!(
+                    "Failed to open log file '{}': {}, using stderr",
+                    log_file_path, e
+                );
+            }
+        }
+    }
+}
+
 #[pymodule]
 fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")
         .write_style("LANCE_LOG_STYLE");
-    let log_builder = env_logger::Builder::from_env(env);
+    let mut log_builder = env_logger::Builder::from_env(env);
+    set_timestamp_precision(&mut log_builder);
+    set_log_file_target(&mut log_builder);
     init_logging(log_builder);
 
     m.add_class::<FFILanceTableProvider>()?;
@@ -144,6 +203,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBlobFile>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
+    m.add_class::<LanceFileSession>()?;
     m.add_class::<LanceFileMetadata>()?;
     m.add_class::<LanceFileStatistics>()?;
     m.add_class::<LanceColumnMetadata>()?;
@@ -160,6 +220,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionMetrics>()?;
     m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
+    m.add_class::<PyTraceEvent>()?;
     m.add_class::<TraceGuard>()?;
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
@@ -172,6 +233,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(infer_tfrecord_schema))?;
     m.add_wrapped(wrap_pyfunction!(read_tfrecord))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
+    m.add_wrapped(wrap_pyfunction!(capture_trace_events))?;
+    m.add_wrapped(wrap_pyfunction!(shutdown_tracing))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;

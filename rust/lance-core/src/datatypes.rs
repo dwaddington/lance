@@ -4,14 +4,13 @@
 //! Lance data types, [Schema] and [Field]
 
 use std::fmt::{self, Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Fields, TimeUnit};
 use deepsize::DeepSizeOf;
-use lance_arrow::bfloat16::{
-    is_bfloat16_field, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME,
-};
+use lance_arrow::bfloat16::{is_bfloat16_field, BFLOAT16_EXT_NAME};
+use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use snafu::location;
 
 mod field;
@@ -24,25 +23,27 @@ pub use field::{
 };
 pub use schema::{OnMissing, Projectable, Projection, Schema};
 
-pub const COMPRESSION_META_KEY: &str = "lance-encoding:compression";
-pub const COMPRESSION_LEVEL_META_KEY: &str = "lance-encoding:compression-level";
+// NOTE: BLOB_META_KEY is used in lance-core's field.rs, so it must stay here
+// to avoid circular dependency with lance-encoding
 pub const BLOB_META_KEY: &str = "lance-encoding:blob";
-pub const PACKED_STRUCT_LEGACY_META_KEY: &str = "packed";
-pub const PACKED_STRUCT_META_KEY: &str = "lance-encoding:packed";
-pub const STRUCTURAL_ENCODING_META_KEY: &str = "lance-encoding:structural-encoding";
-pub const STRUCTURAL_ENCODING_MINIBLOCK: &str = "miniblock";
-pub const STRUCTURAL_ENCODING_FULLZIP: &str = "fullzip";
 
-lazy_static::lazy_static! {
-    pub static ref BLOB_DESC_FIELDS: Fields =
-        Fields::from(vec![
-            ArrowField::new("position", DataType::UInt64, true),
-            ArrowField::new("size", DataType::UInt64, true),
-        ]);
-    pub static ref BLOB_DESC_FIELD: ArrowField =
-    ArrowField::new("description", DataType::Struct(BLOB_DESC_FIELDS.clone()), true);
-    pub static ref BLOB_DESC_LANCE_FIELD: Field = Field::try_from(&*BLOB_DESC_FIELD).unwrap();
-}
+pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("position", DataType::UInt64, true),
+        ArrowField::new("size", DataType::UInt64, true),
+    ])
+});
+
+pub static BLOB_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
+    ArrowField::new(
+        "description",
+        DataType::Struct(BLOB_DESC_FIELDS.clone()),
+        true,
+    )
+});
+
+pub static BLOB_DESC_LANCE_FIELD: LazyLock<Field> =
+    LazyLock::new(|| Field::try_from(&*BLOB_DESC_FIELD).unwrap());
 
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.
@@ -200,6 +201,7 @@ impl TryFrom<&LogicalType> for DataType {
             "binary" => Some(Binary),
             "large_string" => Some(LargeUtf8),
             "large_binary" => Some(LargeBinary),
+            "json" => Some(LargeBinary),
             "date32:day" => Some(Date32),
             "date64:ms" => Some(Date64),
             "time32:s" => Some(Time32(TimeUnit::Second)),

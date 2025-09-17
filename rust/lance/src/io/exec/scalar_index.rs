@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
@@ -9,8 +9,9 @@ use crate::{
     index::{prefilter::DatasetPreFilter, DatasetIndexInternalExt},
     Dataset,
 };
-use arrow_array::{RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_array::{Array, RecordBatch, UInt64Array};
+use arrow_schema::{Schema, SchemaRef};
+use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::{
     common::{stats::Precision, Statistics},
@@ -31,11 +32,19 @@ use lance_core::{
     },
     Error, Result, ROW_ID_FIELD,
 };
-use lance_datafusion::chunker::break_stream;
+use lance_datafusion::{
+    chunker::break_stream,
+    utils::{
+        ExecutionPlanMetricsSetExt, SCALAR_INDEX_SEARCH_TIME_METRIC, SCALAR_INDEX_SER_TIME_METRIC,
+    },
+};
 use lance_index::{
     metrics::MetricsCollector,
     scalar::{
-        expression::{IndexExprResult, ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch},
+        expression::{
+            IndexExprResult, ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch,
+            INDEX_EXPR_RESULT_SCHEMA,
+        },
         SargableQuery, ScalarIndex,
     },
     DatasetIndexExt, ScalarIndexCriteria,
@@ -44,10 +53,6 @@ use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 use snafu::location;
 use tracing::{debug_span, instrument};
-
-lazy_static::lazy_static! {
-    pub static ref SCALAR_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![Field::new("result".to_string(), DataType::Binary, true)]));
-}
 
 #[async_trait]
 impl ScalarIndexLoader for Dataset {
@@ -100,7 +105,7 @@ impl DisplayAs for ScalarIndexExec {
 impl ScalarIndexExec {
     pub fn new(dataset: Arc<Dataset>, expr: ScalarIndexExpr) -> Self {
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(SCALAR_INDEX_SCHEMA.clone()),
+            EquivalenceProperties::new(INDEX_EXPR_RESULT_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -113,20 +118,55 @@ impl ScalarIndexExec {
         }
     }
 
+    #[async_recursion]
+    async fn fragments_covered_by_index_query(
+        index_expr: &ScalarIndexExpr,
+        dataset: &Dataset,
+    ) -> Result<RoaringBitmap> {
+        match index_expr {
+            ScalarIndexExpr::And(lhs, rhs) => {
+                Ok(Self::fragments_covered_by_index_query(lhs, dataset).await?
+                    & Self::fragments_covered_by_index_query(rhs, dataset).await?)
+            }
+            ScalarIndexExpr::Or(lhs, rhs) => {
+                Ok(Self::fragments_covered_by_index_query(lhs, dataset).await?
+                    & Self::fragments_covered_by_index_query(rhs, dataset).await?)
+            }
+            ScalarIndexExpr::Not(expr) => {
+                Self::fragments_covered_by_index_query(expr, dataset).await
+            }
+            ScalarIndexExpr::Query(search_key) => {
+                let idx = dataset
+                    .load_scalar_index(
+                        ScalarIndexCriteria::default().with_name(&search_key.index_name),
+                    )
+                    .await?
+                    .expect("Index not found even though it must have been found earlier");
+                Ok(idx
+                    .fragment_bitmap
+                    .expect("scalar indices should always have a fragment bitmap"))
+            }
+        }
+    }
+
     async fn do_execute(
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
-        metrics: IndexMetrics,
+        plan_metrics: ExecutionPlanMetricsSet,
     ) -> Result<RecordBatch> {
-        let query_result = expr.evaluate(dataset.as_ref(), &metrics).await?;
-        let IndexExprResult::Exact(row_id_mask) = query_result else {
-            todo!("Support for non-exact query results as pre-filter for vector search")
+        let metrics = IndexMetrics::new(&plan_metrics, 0);
+        let query_result = {
+            let search_time = plan_metrics.new_time(SCALAR_INDEX_SEARCH_TIME_METRIC, 0);
+            let _timer = search_time.timer();
+            expr.evaluate(dataset.as_ref(), &metrics).await?
         };
-        let row_id_mask_arr = row_id_mask.into_arrow()?;
-        Ok(RecordBatch::try_new(
-            SCALAR_INDEX_SCHEMA.clone(),
-            vec![Arc::new(row_id_mask_arr)],
-        )?)
+        let fragments_covered_by_result =
+            Self::fragments_covered_by_index_query(&expr, dataset.as_ref()).await?;
+        {
+            let ser_time = plan_metrics.new_time(SCALAR_INDEX_SER_TIME_METRIC, 0);
+            let _timer = ser_time.timer();
+            query_result.serialize_to_arrow(&fragments_covered_by_result)
+        }
     }
 }
 
@@ -140,7 +180,7 @@ impl ExecutionPlan for ScalarIndexExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        SCALAR_INDEX_SCHEMA.clone()
+        INDEX_EXPR_RESULT_SCHEMA.clone()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -165,14 +205,17 @@ impl ExecutionPlan for ScalarIndexExec {
         partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        let metrics = IndexMetrics::new(&self.metrics, partition);
-        let batch_fut = Self::do_execute(self.expr.clone(), self.dataset.clone(), metrics);
+        let batch_fut = Self::do_execute(
+            self.expr.clone(),
+            self.dataset.clone(),
+            self.metrics.clone(),
+        );
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
             .boxed()
             as BoxStream<'static, datafusion::common::Result<RecordBatch>>;
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
-            SCALAR_INDEX_SCHEMA.clone(),
+            INDEX_EXPR_RESULT_SCHEMA.clone(),
             stream,
             partition,
             &self.metrics,
@@ -182,7 +225,7 @@ impl ExecutionPlan for ScalarIndexExec {
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
         Ok(Statistics {
             num_rows: Precision::Exact(2),
-            ..Statistics::new_unknown(&SCALAR_INDEX_SCHEMA)
+            ..Statistics::new_unknown(&INDEX_EXPR_RESULT_SCHEMA)
         })
     }
 
@@ -195,9 +238,8 @@ impl ExecutionPlan for ScalarIndexExec {
     }
 }
 
-lazy_static::lazy_static! {
-    pub static ref INDEX_LOOKUP_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]));
-}
+pub static INDEX_LOOKUP_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
 /// An execution node that translates index values into row addresses
 ///
@@ -263,6 +305,7 @@ impl MapIndexExec {
             column: column_name,
             index_name,
             query: Arc::new(SargableQuery::IsIn(index_vals)),
+            needs_recheck: false,
         });
         let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
         let IndexExprResult::Exact(mut row_id_mask) = query_result else {
@@ -402,9 +445,8 @@ impl ExecutionPlan for MapIndexExec {
     }
 }
 
-lazy_static::lazy_static! {
-    pub static ref MATERIALIZE_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()]));
-}
+pub static MATERIALIZE_INDEX_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
 /// An execution node that performs a scalar index search and materializes the mask into row ids
 ///
@@ -544,7 +586,7 @@ async fn row_ids_for_mask(
     match (mask.allow_list, mask.block_list) {
         (None, None) => {
             // Matches all row ids in the given fragments.
-            if dataset.manifest.uses_move_stable_row_ids() {
+            if dataset.manifest.uses_stable_row_ids() {
                 let sequences = load_row_id_sequences(dataset, fragments)
                     .map_ok(|(_frag_id, sequence)| sequence)
                     .try_collect::<Vec<_>>()
@@ -567,14 +609,14 @@ async fn row_ids_for_mask(
                 Ok(allow_list_iter.map(u64::from).collect::<Vec<_>>())
             } else {
                 // We shouldn't hit this branch if the row ids are stable.
-                debug_assert!(!dataset.manifest.uses_move_stable_row_ids());
+                debug_assert!(!dataset.manifest.uses_stable_row_ids());
                 Ok(FragIdIter::new(fragments)
                     .filter(|row_id| allow_list.contains(*row_id))
                     .collect())
             }
         }
         (None, Some(block_list)) => {
-            if dataset.manifest.uses_move_stable_row_ids() {
+            if dataset.manifest.uses_stable_row_ids() {
                 let sequences = load_row_id_sequences(dataset, fragments)
                     .map_ok(|(_frag_id, sequence)| sequence)
                     .try_collect::<Vec<_>>()
@@ -614,7 +656,7 @@ async fn row_ids_for_mask(
                     .collect::<Vec<_>>())
             } else {
                 // We shouldn't hit this branch if the row ids are stable.
-                debug_assert!(!dataset.manifest.uses_move_stable_row_ids());
+                debug_assert!(!dataset.manifest.uses_stable_row_ids());
                 Ok(FragIdIter::new(fragments)
                     .filter(|row_id| !block_list.contains(*row_id) && allow_list.contains(*row_id))
                     .collect())
@@ -628,7 +670,7 @@ async fn retain_fragments(
     fragments: &[Fragment],
     dataset: &Dataset,
 ) -> Result<()> {
-    if dataset.manifest.uses_move_stable_row_ids() {
+    if dataset.manifest.uses_stable_row_ids() {
         let fragment_ids = load_row_id_sequences(dataset, fragments)
             .map_ok(|(_frag_id, sequence)| RowIdTreeMap::from(sequence.as_ref()))
             .try_fold(RowIdTreeMap::new(), |mut acc, tree| async {
@@ -726,7 +768,7 @@ mod tests {
         scalar::ScalarValue,
     };
     use futures::TryStreamExt;
-    use lance_datagen::gen;
+    use lance_datagen::gen_batch;
     use lance_index::{
         scalar::{
             expression::{ScalarIndexExpr, ScalarIndexSearch},
@@ -753,7 +795,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut dataset = gen()
+        let mut dataset = gen_batch()
             .col("ordered", lance_datagen::array::step::<UInt64Type>())
             .into_dataset(
                 test_uri,
@@ -794,6 +836,7 @@ mod tests {
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
+            needs_recheck: false,
         });
 
         let fragments = dataset.fragments().clone();
@@ -831,6 +874,7 @@ mod tests {
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::UInt64(Some(47))),
             )),
+            needs_recheck: false,
         });
 
         // These plans aren't even valid but it appears we defer all work (even validation) until

@@ -11,6 +11,8 @@
 
 use std::{any::Any, sync::Arc};
 
+use crate::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use crate::mem_wal::MEM_WAL_INDEX_NAME;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -20,6 +22,7 @@ use snafu::location;
 use std::convert::TryFrom;
 
 pub mod frag_reuse;
+pub mod mem_wal;
 pub mod metrics;
 pub mod optimize;
 pub mod prefilter;
@@ -36,6 +39,9 @@ pub const INDEX_FILE_NAME: &str = "index.idx";
 /// - For 'IVF_HNSW' index, it stores the partitioned PQ Storage.
 pub const INDEX_AUXILIARY_FILE_NAME: &str = "auxiliary.idx";
 pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
+
+// Currently all vector indexes are version 1
+pub const VECTOR_INDEX_VERSION: u32 = 1;
 
 pub mod pb {
     #![allow(clippy::use_self)]
@@ -91,6 +97,12 @@ pub enum IndexType {
 
     FragmentReuse = 6,
 
+    MemWal = 7,
+
+    ZoneMap = 8, // ZoneMap
+
+    BloomFilter = 9, // Bloom filter
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -111,6 +123,9 @@ impl std::fmt::Display for IndexType {
             Self::Inverted => write!(f, "Inverted"),
             Self::NGram => write!(f, "NGram"),
             Self::FragmentReuse => write!(f, "FragmentReuse"),
+            Self::MemWal => write!(f, "MemWal"),
+            Self::ZoneMap => write!(f, "ZoneMap"),
+            Self::BloomFilter => write!(f, "BloomFilter"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
             Self::IvfFlat => write!(f, "IVF_FLAT"),
             Self::IvfSq => write!(f, "IVF_SQ"),
@@ -132,6 +147,10 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::LabelList as i32 => Ok(Self::LabelList),
             v if v == Self::NGram as i32 => Ok(Self::NGram),
             v if v == Self::Inverted as i32 => Ok(Self::Inverted),
+            v if v == Self::FragmentReuse as i32 => Ok(Self::FragmentReuse),
+            v if v == Self::MemWal as i32 => Ok(Self::MemWal),
+            v if v == Self::ZoneMap as i32 => Ok(Self::ZoneMap),
+            v if v == Self::BloomFilter as i32 => Ok(Self::BloomFilter),
             v if v == Self::Vector as i32 => Ok(Self::Vector),
             v if v == Self::IvfFlat as i32 => Ok(Self::IvfFlat),
             v if v == Self::IvfSq as i32 => Ok(Self::IvfSq),
@@ -147,6 +166,34 @@ impl TryFrom<i32> for IndexType {
     }
 }
 
+impl TryFrom<&str> for IndexType {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value {
+            "BTree" => Ok(Self::BTree),
+            "Bitmap" => Ok(Self::Bitmap),
+            "LabelList" => Ok(Self::LabelList),
+            "Inverted" => Ok(Self::Inverted),
+            "NGram" => Ok(Self::NGram),
+            "FragmentReuse" => Ok(Self::FragmentReuse),
+            "MemWal" => Ok(Self::MemWal),
+            "ZoneMap" => Ok(Self::ZoneMap),
+            "Vector" => Ok(Self::Vector),
+            "IVF_FLAT" => Ok(Self::IvfFlat),
+            "IVF_SQ" => Ok(Self::IvfSq),
+            "IVF_PQ" => Ok(Self::IvfPq),
+            "IVF_HNSW_FLAT" => Ok(Self::IvfHnswFlat),
+            "IVF_HNSW_SQ" => Ok(Self::IvfHnswSq),
+            "IVF_HNSW_PQ" => Ok(Self::IvfHnswPq),
+            _ => Err(Error::invalid_input(
+                format!("invalid index type: {}", value),
+                location!(),
+            )),
+        }
+    }
+}
+
 impl IndexType {
     pub fn is_scalar(&self) -> bool {
         matches!(
@@ -157,6 +204,8 @@ impl IndexType {
                 | Self::LabelList
                 | Self::Inverted
                 | Self::NGram
+                | Self::ZoneMap
+                | Self::BloomFilter
         )
     }
 
@@ -173,6 +222,10 @@ impl IndexType {
         )
     }
 
+    pub fn is_system(&self) -> bool {
+        matches!(self, Self::FragmentReuse | Self::MemWal)
+    }
+
     /// Returns the current format version of the index type,
     /// bump this when the index format changes.
     /// Indices which higher version than these will be ignored for compatibility,
@@ -187,6 +240,9 @@ impl IndexType {
             Self::Inverted => 0,
             Self::NGram => 0,
             Self::FragmentReuse => 0,
+            Self::MemWal => 0,
+            Self::ZoneMap => 0,
+            Self::BloomFilter => 0,
 
             // for now all vector indices are built by the same builder,
             // so they share the same version.
@@ -199,12 +255,29 @@ impl IndexType {
             | Self::IvfHnswFlat => 1,
         }
     }
+
+    /// Returns the target partition size for the index type.
+    ///
+    /// This is used to compute the number of partitions for the index.
+    /// The partition size is optimized for the best performance of the index.
+    ///
+    /// This is for vector indices only.
+    pub fn target_partition_size(&self) -> usize {
+        match self {
+            Self::Vector => 8192,
+            Self::IvfFlat => 4096,
+            Self::IvfSq => 8192,
+            Self::IvfPq => 8192,
+            Self::IvfHnswFlat => 1 << 20,
+            Self::IvfHnswSq => 1 << 20,
+            Self::IvfHnswPq => 1 << 20,
+            _ => 8192,
+        }
+    }
 }
 
 pub trait IndexParams: Send + Sync {
     fn as_any(&self) -> &dyn Any;
-
-    fn index_type(&self) -> IndexType;
 
     fn index_name(&self) -> &str;
 }
@@ -214,4 +287,18 @@ pub struct IndexMetadata {
     #[serde(rename = "type")]
     pub index_type: String,
     pub distance_type: String,
+}
+
+pub fn is_system_index(index_meta: &lance_table::format::Index) -> bool {
+    index_meta.name == FRAG_REUSE_INDEX_NAME || index_meta.name == MEM_WAL_INDEX_NAME
+}
+
+pub fn infer_system_index_type(index_meta: &lance_table::format::Index) -> Option<IndexType> {
+    if index_meta.name == FRAG_REUSE_INDEX_NAME {
+        Some(IndexType::FragmentReuse)
+    } else if index_meta.name == MEM_WAL_INDEX_NAME {
+        Some(IndexType::MemWal)
+    } else {
+        None
+    }
 }

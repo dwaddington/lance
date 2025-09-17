@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use super::Dataset;
 use crate::io::exec::{ShareableRecordBatchStream, ShareableRecordBatchStreamAdapter};
 use lance_core::{
-    datatypes::{Schema, StorageClass, BLOB_META_KEY},
+    datatypes::{Schema, StorageClass},
     error::CloneableResult,
     utils::{
         address::RowAddress,
@@ -59,8 +59,8 @@ impl BlobFile {
     ) -> Self {
         let frag_id = RowAddress::from(row_addr).fragment_id();
         let frag = dataset.get_fragment(frag_id as usize).unwrap();
-        let data_file = frag.data_file_for_field(field_id).unwrap().path.clone();
-        let data_file = dataset.data_dir().child(data_file);
+        let data_file = frag.data_file_for_field(field_id).unwrap();
+        let data_file = dataset.data_dir().child(data_file.path.as_str());
         Self {
             dataset,
             data_file,
@@ -189,9 +189,7 @@ pub(super) async fn take_blobs(
     let projection = dataset.schema().project(&[column])?;
     let blob_field = &projection.fields[0];
     let blob_field_id = blob_field.id;
-    if blob_field.data_type() != DataType::LargeBinary
-        || !projection.fields[0].metadata.contains_key(BLOB_META_KEY)
-    {
+    if blob_field.data_type() != DataType::LargeBinary || !projection.fields[0].is_blob() {
         return Err(Error::InvalidInput {
             location: location!(),
             source: format!("the column '{}' is not a blob column", column).into(),
@@ -291,6 +289,9 @@ mod tests {
 
     use arrow::{array::AsArray, datatypes::UInt64Type};
     use arrow_array::RecordBatch;
+    use futures::TryStreamExt;
+    use lance_arrow::DataTypeExt;
+    use lance_io::stream::RecordBatchStream;
     use tempfile::{tempdir, TempDir};
 
     use lance_core::{Error, Result};
@@ -310,7 +311,7 @@ mod tests {
             let test_dir = tempdir().unwrap();
             let test_uri = test_dir.path().to_str().unwrap();
 
-            let data = lance_datagen::gen()
+            let data = lance_datagen::gen_batch()
                 .col("filterme", array::step::<UInt64Type>())
                 .col("blobs", array::blob())
                 .into_reader_rows(RowCount::from(10), BatchCount::from(10))
@@ -419,5 +420,56 @@ mod tests {
 
         assert!(matches!(err, Err(Error::InvalidInput { .. })));
         assert!(err.unwrap_err().to_string().contains("not a blob column"));
+    }
+
+    #[tokio::test]
+    pub async fn test_scan_blobs() {
+        let fixture = BlobTestFixture::new().await;
+
+        // By default, scanning a blob column will load descriptions
+        let batches = fixture
+            .dataset
+            .scan()
+            .project(&["blobs"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+
+        let schema = batches.schema();
+
+        assert!(schema.fields[0].data_type().is_struct());
+
+        let batches = batches.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(batches.len(), 10);
+        for batch in batches.iter() {
+            assert_eq!(batch.num_columns(), 1);
+            assert!(batch.column(0).data_type().is_struct());
+        }
+
+        // Should also be able to scan with filter
+        let batches = fixture
+            .dataset
+            .scan()
+            .project(&["blobs"])
+            .unwrap()
+            .filter("filterme = 50")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+
+        let schema = batches.schema();
+
+        assert!(schema.fields[0].data_type().is_struct());
+
+        let batches = batches.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(batches.len(), 1);
+        for batch in batches.iter() {
+            assert_eq!(batch.num_columns(), 1);
+            assert!(batch.column(0).data_type().is_struct());
+        }
     }
 }

@@ -31,6 +31,7 @@ use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_file::v2::reader::FileReaderOptions;
 use lance_io::ReadBatchParams;
 use lance_table::format::Fragment;
 use snafu::location;
@@ -70,6 +71,8 @@ pub struct ScanConfig {
     /// If true (default), the scan will emit batches in the same order as the
     /// fragments. If false, the scan may emit batches in an arbitrary order.
     pub ordered_output: bool,
+    /// File reader options to use when reading data files.
+    pub file_reader_options: Option<FileReaderOptions>,
 }
 
 impl Default for ScanConfig {
@@ -81,6 +84,7 @@ impl Default for ScanConfig {
             with_row_address: false,
             make_deletions_null: false,
             ordered_output: true,
+            file_reader_options: None,
         }
     }
 }
@@ -301,9 +305,11 @@ impl FragmentScanner {
 
         // We will call the reader with projections. In order for this to work
         // we must ensure that we open the fragment with the maximal schema.
-        let mut reader = fragment
-            .open(dataset.schema(), FragReadConfig::default())
-            .await?;
+        let mut frag_config = FragReadConfig::default();
+        if let Some(file_reader_options) = config.file_reader_options.clone() {
+            frag_config = frag_config.with_file_reader_options(file_reader_options);
+        }
+        let mut reader = fragment.open(dataset.schema(), frag_config).await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();
         }
@@ -338,7 +344,7 @@ impl FragmentScanner {
             .filter(|(_, predicate)| {
                 futures::future::ready(!matches!(
                     predicate,
-                    Expr::Literal(ScalarValue::Boolean(Some(false)))
+                    Expr::Literal(ScalarValue::Boolean(Some(false)), _)
                 ))
             })
             .map(move |(batch_id, predicate)| {
@@ -370,7 +376,7 @@ impl FragmentScanner {
 
     async fn read_batch(&self, batch_id: usize, predicate: Expr) -> Result<Option<RecordBatch>> {
         match predicate {
-            Expr::Literal(ScalarValue::Boolean(Some(true))) => {
+            Expr::Literal(ScalarValue::Boolean(Some(true)), _) => {
                 // Predicate is always true, we just need to load the projection.
                 let mut projection_reader = self.reader.clone();
                 if self.config.with_row_id {
@@ -385,7 +391,7 @@ impl FragmentScanner {
                 let batch = self.final_projection(batch)?;
                 Ok(Some(batch))
             }
-            Expr::Literal(ScalarValue::Boolean(Some(false))) => {
+            Expr::Literal(ScalarValue::Boolean(Some(false)), _) => {
                 // Predicate is always false, we can skip this batch.
                 Ok(None)
             }
