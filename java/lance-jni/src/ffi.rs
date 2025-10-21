@@ -56,6 +56,9 @@ pub trait JNIEnvExt {
     /// Get Option<bool> from Java Optional<Boolean>.
     fn get_boolean_opt(&mut self, obj: &JObject) -> Result<Option<bool>>;
 
+    /// Get Option<f32> from Java Optional<Float>.
+    fn get_f32_opt(&mut self, obj: &JObject) -> Result<Option<f32>>;
+
     /// Get Option<&[u8]> from Java Optional<ByteBuffer>.
     fn get_bytes_opt(&mut self, obj: &JObject) -> Result<Option<&[u8]>>;
 
@@ -96,6 +99,27 @@ pub trait JNIEnvExt {
     where
         T: TryFrom<i32>,
         <T as TryFrom<i32>>::Error: std::fmt::Debug;
+
+    fn get_optional_u64_from_method(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<u64>>;
+
+    fn get_optional_i64_from_method(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<i64>>;
+
+    fn get_optional_long_from_method<T>(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<T>>
+    where
+        T: TryFrom<i64>,
+        <T as TryFrom<i64>>::Error: std::fmt::Debug;
 
     fn get_optional_string_from_method(
         &mut self,
@@ -221,6 +245,16 @@ impl JNIEnvExt for JNIEnv<'_> {
         })
     }
 
+    fn get_f32_opt(&mut self, obj: &JObject) -> Result<Option<f32>> {
+        self.get_optional(obj, |env, inner_obj| {
+            let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
+            let java_float_obj = java_obj_gen.l()?;
+            let float_obj = env.call_method(java_float_obj, "floatValue", "()F", &[])?;
+            let float_value = float_obj.f()?;
+            Ok(float_value)
+        })
+    }
+
     fn get_u64_opt(&mut self, obj: &JObject) -> Result<Option<u64>> {
         self.get_optional(obj, |env, inner_obj| {
             let java_obj_gen = env.call_method(inner_obj, "get", "()Ljava/lang/Object;", &[])?;
@@ -316,6 +350,53 @@ impl JNIEnvExt for JNIEnv<'_> {
                 .call_method(&java_object, "get", "()Ljava/lang/Object;", &[])?
                 .l()?;
             let inner_value = self.call_method(&inner_jobj, "intValue", "()I", &[])?.i()?;
+            Some(T::try_from(inner_value).map_err(|e| {
+                Error::io_error(format!("Failed to convert from i32 to rust type: {:?}", e))
+            })?)
+        } else {
+            None
+        };
+        Ok(rust_obj)
+    }
+
+    fn get_optional_i64_from_method(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<i64>> {
+        self.get_optional_long_from_method(obj, method_name)
+    }
+
+    fn get_optional_u64_from_method(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<u64>> {
+        self.get_optional_long_from_method(obj, method_name)
+    }
+
+    fn get_optional_long_from_method<T>(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<T>>
+    where
+        T: TryFrom<i64>,
+        <T as TryFrom<i64>>::Error: std::fmt::Debug,
+    {
+        let java_object = self
+            .call_method(obj, method_name, "()Ljava/util/Optional;", &[])?
+            .l()?;
+        let rust_obj = if self
+            .call_method(&java_object, "isPresent", "()Z", &[])?
+            .z()?
+        {
+            let inner_jobj = self
+                .call_method(&java_object, "get", "()Ljava/lang/Object;", &[])?
+                .l()?;
+            let inner_value = self
+                .call_method(&inner_jobj, "longValue", "()J", &[])?
+                .j()?;
             Some(T::try_from(inner_value).map_err(|e| {
                 Error::io_error(format!("Failed to convert from i32 to rust type: {:?}", e))
             })?)

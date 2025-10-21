@@ -21,8 +21,11 @@ use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{stream, StreamExt};
 use roaring::RoaringTreemap;
 
+use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::utils::CapturedRowIds;
-use crate::dataset::write::merge_insert::create_duplicate_row_error;
+use crate::dataset::write::merge_insert::{
+    create_duplicate_row_error, format_key_values_on_columns,
+};
 use crate::{
     dataset::{
         transaction::{Operation, Transaction},
@@ -118,6 +121,13 @@ impl MergeState {
             Action::Nothing => {
                 // Do nothing action - keep the row but don't count it
                 Ok(None)
+            }
+            Action::Fail => {
+                // Fail action - return an error to fail the operation
+                Err(datafusion::error::DataFusionError::Execution(format!(
+                    "Merge insert failed: found matching row with key values: {}",
+                    format_key_values_on_columns(batch, row_idx, &self.on_columns)
+                )))
             }
         }
     }
@@ -483,7 +493,7 @@ impl FullSchemaMergeInsertExec {
 
         enum FragmentChange {
             Unchanged,
-            Modified(Fragment),
+            Modified(Box<Fragment>),
             Removed(u64),
         }
 
@@ -498,7 +508,7 @@ impl FullSchemaMergeInsertExec {
                     if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
                         match fragment.extend_deletions(*bitmap).await {
                             Ok(Some(new_fragment)) => {
-                                Ok(FragmentChange::Modified(new_fragment.metadata))
+                                Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
                             }
                             Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
                             Err(e) => Err(e),
@@ -513,7 +523,7 @@ impl FullSchemaMergeInsertExec {
         while let Some(res) = stream.next().await.transpose()? {
             match res {
                 FragmentChange::Unchanged => {}
-                FragmentChange::Modified(fragment) => updated_fragments.push(fragment),
+                FragmentChange::Modified(fragment) => updated_fragments.push(*fragment),
                 FragmentChange::Removed(fragment_id) => removed_fragments.push(fragment_id),
             }
         }
@@ -690,6 +700,7 @@ impl DisplayAs for FullSchemaMergeInsertExec {
                     crate::dataset::WhenMatched::UpdateIf(condition) => {
                         format!("UpdateIf({})", condition)
                     }
+                    crate::dataset::WhenMatched::Fail => "Fail".to_string(),
                 };
                 let when_not_matched = if self.params.insert_not_matched {
                     "InsertAll"
@@ -764,6 +775,10 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         &self.properties
     }
 
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
+
     fn required_input_distribution(&self) -> Vec<datafusion_physical_expr::Distribution> {
         // We require a single partition for the merge operation to ensure all data is processed
         vec![datafusion_physical_expr::Distribution::SinglePartition]
@@ -818,6 +833,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 dataset.schema().clone(),
                 write_data_stream,
                 WriteParams::default(),
+                None, // Merge insert doesn't use target_bases
             )
             .await?;
 
@@ -868,6 +884,13 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 new_fragments,
                 fields_modified: vec![], // No fields are modified in schema for upsert
                 mem_wal_to_merge,
+                fields_for_preserving_frag_bitmap: dataset
+                    .schema()
+                    .fields
+                    .iter()
+                    .map(|f| f.id as u32)
+                    .collect(),
+                update_mode: Some(RewriteRows),
             };
 
             // Step 5: Create and store the transaction

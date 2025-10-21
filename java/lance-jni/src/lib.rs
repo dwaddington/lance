@@ -39,6 +39,7 @@ macro_rules! ok_or_throw_with_return {
     };
 }
 
+mod blocking_blob;
 mod blocking_dataset;
 mod blocking_scanner;
 pub mod error;
@@ -47,6 +48,7 @@ mod file_reader;
 mod file_writer;
 mod fragment;
 mod merge_insert;
+mod optimize;
 mod schema;
 mod sql;
 pub mod traits;

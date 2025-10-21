@@ -4,8 +4,10 @@
 use std::sync::Arc;
 
 use arrow::array::Float32Array;
-use jni::objects::{JMap, JObject, JString, JValue};
+use jni::objects::{JMap, JObject, JString, JValue, JValueGen};
+use jni::sys::{jboolean, jfloat, jlong};
 use jni::JNIEnv;
+use lance::dataset::optimize::CompactionOptions;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
@@ -22,6 +24,7 @@ use crate::ffi::JNIEnvExt;
 
 use lance_index::vector::Query;
 use std::collections::HashMap;
+use std::str::FromStr;
 
 pub fn extract_storage_options(
     env: &mut JNIEnv,
@@ -32,6 +35,7 @@ pub fn extract_storage_options(
     Ok(storage_options)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn extract_write_params(
     env: &mut JNIEnv,
     max_rows_per_file: &JObject,
@@ -39,6 +43,7 @@ pub fn extract_write_params(
     max_bytes_per_file: &JObject,
     mode: &JObject,
     enable_stable_row_ids: &JObject,
+    data_storage_version: &JObject,
     storage_options_obj: &JObject,
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
@@ -58,8 +63,11 @@ pub fn extract_write_params(
     if let Some(enable_stable_row_ids_val) = env.get_boolean_opt(enable_stable_row_ids)? {
         write_params.enable_stable_row_ids = enable_stable_row_ids_val;
     }
-    // Java code always sets the data storage version to stable for now
-    write_params.data_storage_version = Some(LanceFileVersion::Stable);
+    if let Some(data_storage_version_val) = env.get_string_opt(data_storage_version)? {
+        write_params.data_storage_version = Some(LanceFileVersion::from_str(
+            data_storage_version_val.as_str(),
+        )?);
+    }
     let storage_options: HashMap<String, String> =
         extract_storage_options(env, storage_options_obj)?;
 
@@ -68,6 +76,50 @@ pub fn extract_write_params(
         ..Default::default()
     });
     Ok(write_params)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_compaction_options(
+    env: &mut JNIEnv,
+    target_rows_per_fragment: &JObject,        // Optional<Long>
+    max_rows_per_group: &JObject,              // Optional<Long>
+    max_bytes_per_file: &JObject,              // Optional<Long>
+    materialize_deletions: &JObject,           // Optional<Boolean>
+    materialize_deletions_threshold: &JObject, // Optional<Float>
+    num_threads: &JObject,                     // Optional<Long>
+    batch_size: &JObject,                      // Optional<Long>
+    defer_index_remap: &JObject,               // Optional<Boolean>
+) -> Result<CompactionOptions> {
+    let mut compaction_options = CompactionOptions::default();
+
+    if let Some(target_rows_per_fragment_val) = env.get_long_opt(target_rows_per_fragment)? {
+        compaction_options.target_rows_per_fragment = target_rows_per_fragment_val as usize;
+    }
+    if let Some(max_rows_per_group_val) = env.get_long_opt(max_rows_per_group)? {
+        compaction_options.max_rows_per_group = max_rows_per_group_val as usize;
+    }
+    if let Some(max_bytes_per_file_val) = env.get_long_opt(max_bytes_per_file)? {
+        compaction_options.max_bytes_per_file = Some(max_bytes_per_file_val as usize);
+    }
+    if let Some(materialize_deletions_val) = env.get_boolean_opt(materialize_deletions)? {
+        compaction_options.materialize_deletions = materialize_deletions_val;
+    }
+    if let Some(materialize_deletions_threshold_val) =
+        env.get_f32_opt(materialize_deletions_threshold)?
+    {
+        compaction_options.materialize_deletions_threshold = materialize_deletions_threshold_val;
+    }
+    if let Some(num_threads_val) = env.get_long_opt(num_threads)? {
+        compaction_options.num_threads = Some(num_threads_val as usize);
+    }
+    if let Some(batch_size_val) = env.get_long_opt(batch_size)? {
+        compaction_options.batch_size = Some(batch_size_val as usize);
+    }
+    if let Some(defer_index_remap_val) = env.get_boolean_opt(defer_index_remap)? {
+        compaction_options.defer_index_remap = defer_index_remap_val;
+    }
+
+    Ok(compaction_options)
 }
 
 // Convert from Java Optional<Query> to Rust Option<Query>
@@ -109,6 +161,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             refine_factor,
             metric_type: distance_type,
             use_index,
+            dist_q_c: 0.0,
         })
     })?;
 
@@ -368,4 +421,60 @@ pub fn to_java_list<'local>(
         )?;
     }
     Ok(java_list)
+}
+
+pub fn to_java_optional<'local>(
+    env: &mut JNIEnv<'local>,
+    value: JObject,
+) -> Result<JObject<'local>> {
+    Ok(env
+        .call_static_method(
+            "java/util/Optional",
+            "ofNullable",
+            "(Ljava/lang/Object;)Ljava/util/Optional;",
+            &[JValueGen::Object(&value)],
+        )?
+        .l()?)
+}
+
+pub fn to_java_long_obj<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<i64>,
+) -> Result<JObject<'local>> {
+    match value {
+        Some(base_index) => Ok(env.new_object(
+            "java/lang/Long",
+            "(J)V",
+            &[JValue::Long(base_index as jlong)],
+        )?),
+        None => Ok(JObject::null()),
+    }
+}
+
+pub fn to_java_boolean_obj<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<bool>,
+) -> Result<JObject<'local>> {
+    match value {
+        Some(base_index) => Ok(env.new_object(
+            "java/lang/Boolean",
+            "(Z)V",
+            &[JValue::Bool(base_index as jboolean)],
+        )?),
+        None => Ok(JObject::null()),
+    }
+}
+
+pub fn to_java_float_obj<'local>(
+    env: &mut JNIEnv<'local>,
+    value: Option<f32>,
+) -> Result<JObject<'local>> {
+    match value {
+        Some(base_index) => Ok(env.new_object(
+            "java/lang/Float",
+            "(F)V",
+            &[JValue::Float(base_index as jfloat)],
+        )?),
+        None => Ok(JObject::null()),
+    }
 }

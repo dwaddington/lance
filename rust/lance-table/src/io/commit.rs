@@ -61,7 +61,7 @@ use {
     std::time::{Duration, SystemTime},
 };
 
-use crate::format::{is_detached_version, Index, Manifest};
+use crate::format::{is_detached_version, IndexMetadata, Manifest};
 
 const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
@@ -179,7 +179,7 @@ pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Pat
 pub type ManifestWriter = for<'a> fn(
     object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
-    indices: Option<Vec<Index>>,
+    indices: Option<Vec<IndexMetadata>>,
     path: &'a Path,
 ) -> BoxFuture<'a, Result<WriteResult>>;
 
@@ -547,7 +547,7 @@ pub trait CommitHandler: Debug + Send + Sync {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<Index>>,
+        indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -807,7 +807,7 @@ impl CommitHandler for UnsafeCommitHandler {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<Index>>,
+        indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -873,7 +873,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<Index>>,
+        indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -923,7 +923,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<Index>>,
+        indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -952,7 +952,7 @@ impl CommitHandler for RenameCommitHandler {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<Index>>,
+        indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -1010,7 +1010,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
     async fn commit(
         &self,
         manifest: &mut Manifest,
-        indices: Option<Vec<Index>>,
+        indices: Option<Vec<IndexMetadata>>,
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
@@ -1075,6 +1075,8 @@ impl Default for CommitConfig {
 
 #[cfg(test)]
 mod tests {
+    use lance_core::utils::tempfile::TempObjDir;
+
     use super::*;
 
     #[test]
@@ -1166,12 +1168,11 @@ mod tests {
         let (object_store, base) = if lexical_list_store {
             (Box::new(ObjectStore::memory()), Path::from("base"))
         } else {
-            tempdir = Some(tempfile::tempdir().unwrap());
-            let base = Path::from_absolute_path(tempdir.as_ref().unwrap().path().to_str().unwrap())
-                .unwrap();
+            tempdir = TempObjDir::default();
+            let path = tempdir.child("base");
             let store = Box::new(ObjectStore::local());
             assert!(!store.list_is_lexically_ordered);
-            (store, base)
+            (store, path)
         };
 
         // Write 12 manifest files, latest first

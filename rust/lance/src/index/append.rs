@@ -10,7 +10,7 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::CreatedIndex;
 use lance_index::VECTOR_INDEX_VERSION;
-use lance_table::format::{Fragment, Index as IndexMetadata};
+use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use snafu::location;
 use uuid::Uuid;
@@ -22,6 +22,7 @@ use crate::dataset::Dataset;
 use crate::index::scalar::load_training_data;
 use crate::index::vector_index_details;
 
+#[derive(Debug, Clone)]
 pub struct IndexMergeResults<'a> {
     pub new_uuid: Uuid,
     pub removed_indices: Vec<&'a IndexMetadata>,
@@ -82,10 +83,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             location: location!(),
         })?;
 
+    let field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
     let mut indices = Vec::with_capacity(old_indices.len());
     for idx in old_indices {
         let index = dataset
-            .open_generic_index(&column.name, &idx.uuid.to_string(), &NoOpMetricsCollector)
+            .open_generic_index(&field_path, &idx.uuid.to_string(), &NoOpMetricsCollector)
             .await?;
         indices.push(index);
     }
@@ -116,7 +118,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
             let index = dataset
                 .open_scalar_index(
-                    &column.name,
+                    &field_path,
                     &old_indices[0].uuid.to_string(),
                     &NoOpMetricsCollector,
                 )
@@ -131,7 +133,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             };
             let new_data_stream = load_training_data(
                 dataset.as_ref(),
-                &column.name,
+                &field_path,
                 &update_criteria.data_criteria,
                 fragments,
                 true,
@@ -163,9 +165,9 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 scanner
                     .with_fragments(unindexed.to_vec())
                     .with_row_id()
-                    .project(&[&column.name])?;
+                    .project(&[&field_path])?;
                 if column.nullable {
-                    scanner.filter_expr(datafusion_expr::col(&column.name).is_not_null());
+                    scanner.filter_expr(datafusion_expr::col(&field_path).is_not_null());
                 }
                 Some(scanner.try_into_stream().await?)
             };
@@ -173,7 +175,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             let (new_uuid, indices_merged) = optimize_vector_indices(
                 dataset.as_ref().clone(),
                 new_data_stream,
-                &column.name,
+                &field_path,
                 &indices,
                 options,
             )
@@ -221,6 +223,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use futures::{stream, StreamExt, TryStreamExt};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{array, Dimension, RowCount};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -233,7 +236,6 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
     use rstest::rstest;
-    use tempfile::tempdir;
 
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteParams};
@@ -246,8 +248,8 @@ mod tests {
         const DIM: usize = 64;
         const IVF_PARTITIONS: usize = 2;
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let vectors = generate_random_array(1000 * DIM);
 
@@ -379,8 +381,8 @@ mod tests {
         const DIM: usize = 64;
         const TOTAL: usize = 1000;
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         let vectors = generate_random_array(TOTAL * DIM);
 
@@ -468,8 +470,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_merge_indices_after_merge_insert() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
 
         // Create initial dataset using lance_datagen
         let mut dataset = lance_datagen::gen_batch()

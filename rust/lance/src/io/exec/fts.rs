@@ -21,21 +21,21 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::{utils::tracing::StreamTracingExt, ROW_ID};
 
+use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
+use super::PreFilterSource;
+use crate::{index::DatasetIndexInternalExt, Dataset};
 use lance_index::metrics::MetricsCollector;
+use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::query::{
-    collect_tokens, BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery,
+    collect_query_tokens, BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery,
 };
+use lance_index::scalar::inverted::tokenizer::lance_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, SCORE_COL,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
 use tracing::instrument;
-
-use crate::{index::DatasetIndexInternalExt, Dataset};
-
-use super::utils::{build_prefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter};
-use super::PreFilterSource;
 
 pub struct FtsIndexMetrics {
     index_metrics: IndexMetrics,
@@ -251,11 +251,14 @@ impl ExecutionPlan for MatchQueryExec {
                 .with_prefix_length(query.prefix_length);
             let mut tokenizer = match is_fuzzy {
                 false => inverted_idx.tokenizer(),
-                true => tantivy::tokenizer::TextAnalyzer::from(
-                    tantivy::tokenizer::SimpleTokenizer::default(),
-                ),
+                true => {
+                    let tokenizer = tantivy::tokenizer::TextAnalyzer::from(
+                        tantivy::tokenizer::SimpleTokenizer::default(),
+                    );
+                    Box::new(TextTokenizer::new(tokenizer))
+                }
             };
-            let tokens = collect_tokens(&query.terms, &mut tokenizer, None);
+            let tokens = collect_query_tokens(&query.terms, &mut tokenizer, None);
 
             pre_filter.wait_for_ready().await?;
             let (doc_ids, mut scores) = inverted_idx
@@ -299,6 +302,10 @@ impl ExecutionPlan for MatchQueryExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 
@@ -394,12 +401,13 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let ds = self.dataset.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
-        let unindexed_input = self.unindexed_input.execute(partition, context)?;
 
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
             query.terms
         )))?;
+        let unindexed_input =
+            document_input(self.unindexed_input.execute(partition, context)?, &column)?;
 
         let stream = stream::once(async move {
             let index_meta = ds
@@ -408,29 +416,23 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         .for_column(&column)
                         .supports_fts(),
                 )
-                .await?
-                .ok_or(DataFusionError::Execution(format!(
-                    "No Inverted index found for column {}",
-                    column,
-                )))?;
-            let uuid = index_meta.uuid.to_string();
-            let index = ds
-                .open_generic_index(&column, &uuid, &metrics.index_metrics)
                 .await?;
-            let inverted_idx = index
-                .as_any()
-                .downcast_ref::<InvertedIndex>()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Index for column {} is not an inverted index",
-                        column,
-                    ))
-                })?;
+            let inverted_idx = match index_meta {
+                Some(index_meta) => {
+                    let uuid = index_meta.uuid.to_string();
+                    let index = ds
+                        .open_generic_index(&column, &uuid, &metrics.index_metrics)
+                        .await?;
+                    index.as_any().downcast_ref::<InvertedIndex>().cloned()
+                }
+                None => None,
+            };
+
             Ok::<_, DataFusionError>(flat_bm25_search_stream(
                 unindexed_input,
                 column,
                 query.terms,
-                inverted_idx,
+                &inverted_idx,
             ))
         })
         .try_flatten_unordered(None)
@@ -461,6 +463,10 @@ impl ExecutionPlan for FlatMatchQueryExec {
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -490,7 +496,7 @@ impl PhraseQueryExec {
     pub fn new(
         dataset: Arc<Dataset>,
         query: PhraseQuery,
-        params: FtsSearchParams,
+        mut params: FtsSearchParams,
         prefilter_source: PreFilterSource,
     ) -> Self {
         let properties = PlanProperties::new(
@@ -499,7 +505,7 @@ impl PhraseQueryExec {
             EmissionType::Final,
             Boundedness::Bounded,
         );
-        assert_eq!(params.phrase_slop, Some(query.slop));
+        params = params.with_phrase_slop(Some(query.slop));
 
         Self {
             dataset,
@@ -635,7 +641,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 })?;
 
             let mut tokenizer = index.tokenizer();
-            let tokens = collect_tokens(&query.terms, &mut tokenizer, None);
+            let tokens = collect_query_tokens(&query.terms, &mut tokenizer, None);
 
             pre_filter.wait_for_ready().await?;
             let (doc_ids, scores) = index
@@ -674,6 +680,10 @@ impl ExecutionPlan for PhraseQueryExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 
@@ -845,6 +855,10 @@ impl ExecutionPlan for BoostQueryExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
     }
 }
 

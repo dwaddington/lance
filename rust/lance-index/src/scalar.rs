@@ -8,7 +8,7 @@ use arrow_array::{ListArray, RecordBatch};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 use datafusion::functions::string::contains::ContainsFunc;
-use datafusion::functions_array::array_has;
+use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{scalar::ScalarValue, Column};
 use std::collections::{HashMap, HashSet};
@@ -331,13 +331,9 @@ impl FullTextSearchQuery {
     }
 
     pub fn params(&self) -> FtsSearchParams {
-        let params = FtsSearchParams::new()
+        FtsSearchParams::new()
             .with_limit(self.limit.map(|limit| limit as usize))
-            .with_wand_factor(self.wand_factor.unwrap_or(1.0));
-        match self.query {
-            FtsQuery::Phrase(ref query) => params.with_phrase_slop(Some(query.slop)),
-            _ => params,
-        }
+            .with_wand_factor(self.wand_factor.unwrap_or(1.0))
     }
 }
 

@@ -15,12 +15,14 @@ use futures::{
 };
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::datatypes::Schema;
+use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::ROW_ID;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_file::v2::writer::FileWriter;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::vector::bq::storage::RABIT_CODE_COLUMN;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
     QuantizationMetadata, QuantizationType, QuantizerBuildParams,
@@ -56,7 +58,6 @@ use log::info;
 use object_store::path::Path;
 use prost::Message;
 use snafu::location;
-use tempfile::{tempdir, TempDir};
 use tracing::{instrument, span, Level};
 
 use crate::dataset::ProjectionRequest;
@@ -86,7 +87,7 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     ivf_params: Option<IvfBuildParams>,
     quantizer_params: Option<Q::BuildParams>,
     sub_index_params: Option<S::BuildParams>,
-    _temp_dir: TempDir, // store this for keeping the temp dir alive and clean up after build
+    _temp_dir: TempStdDir, // store this for keeping the temp dir alive and clean up after build
     temp_dir: Path,
 
     // fields will be set during build
@@ -116,8 +117,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         sub_index_params: S::BuildParams,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let temp_dir = tempdir()?;
-        let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
+        let temp_dir = TempStdDir::default();
+        let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
         Ok(Self {
             store: dataset.object_store().clone(),
             column,
@@ -176,8 +177,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     location!(),
                 ))?;
 
-        let temp_dir = tempdir()?;
-        let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
+        let temp_dir = TempStdDir::default();
+        let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
         Ok(Self {
             store,
             column,
@@ -250,11 +251,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             location: location!(),
                         },
                     )?;
-                    Result::Ok(Some((
-                        part.storage.remap(&mapping)?,
-                        part.index.remap(&mapping)?,
-                        0.0,
-                    )))
+
+                    let storage = part.storage.remap(&mapping)?;
+                    let index = part.index.remap(&mapping, &storage)?;
+                    Result::Ok(Some((storage, index, 0.0)))
                 }
             })
             .buffered(get_num_compute_intensive_cpus())
@@ -694,26 +694,50 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let part_storage = existing_index.load_partition_storage(part_id).await?;
             let mut part_batches = part_storage.to_batches()?.collect::<Vec<_>>();
             // for PQ, the PQ codes are transposed, so we need to transpose them back
-            if matches!(Q::quantization_type(), QuantizationType::Product) {
-                for batch in part_batches.iter_mut() {
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
+            match Q::quantization_type() {
+                QuantizationType::Product => {
+                    for batch in part_batches.iter_mut() {
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
 
-                    let codes = batch[PQ_CODE_COLUMN]
-                        .as_fixed_size_list()
-                        .values()
-                        .as_primitive::<datatypes::UInt8Type>();
-                    let codes_num_bytes = codes.len() / batch.num_rows();
-                    let original_codes = transpose(codes, codes_num_bytes, batch.num_rows());
-                    let original_codes = FixedSizeListArray::try_new_from_values(
-                        original_codes,
-                        codes_num_bytes as i32,
-                    )?;
-                    *batch = batch
-                        .replace_column_by_name(PQ_CODE_COLUMN, Arc::new(original_codes))?
-                        .drop_column(PART_ID_COLUMN)?;
+                        let codes = batch[PQ_CODE_COLUMN]
+                            .as_fixed_size_list()
+                            .values()
+                            .as_primitive::<datatypes::UInt8Type>();
+                        let codes_num_bytes = codes.len() / batch.num_rows();
+                        let original_codes = transpose(codes, codes_num_bytes, batch.num_rows());
+                        let original_codes = FixedSizeListArray::try_new_from_values(
+                            original_codes,
+                            codes_num_bytes as i32,
+                        )?;
+                        *batch = batch
+                            .replace_column_by_name(PQ_CODE_COLUMN, Arc::new(original_codes))?
+                            .drop_column(PART_ID_COLUMN)?;
+                    }
                 }
+                QuantizationType::Rabit => {
+                    for batch in part_batches.iter_mut() {
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+
+                        let codes = batch[RABIT_CODE_COLUMN]
+                            .as_fixed_size_list()
+                            .values()
+                            .as_primitive::<datatypes::UInt8Type>();
+                        let codes_num_bytes = codes.len() / batch.num_rows();
+                        let original_codes = transpose(codes, codes_num_bytes, batch.num_rows());
+                        let original_codes = FixedSizeListArray::try_new_from_values(
+                            original_codes,
+                            codes_num_bytes as i32,
+                        )?;
+                        *batch = batch
+                            .replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(original_codes))?
+                            .drop_column(PART_ID_COLUMN)?;
+                    }
+                }
+                _ => {}
             }
             batches.extend(part_batches);
         }
@@ -757,9 +781,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
         let index_path = self.index_dir.child(INDEX_FILE_NAME);
 
-        let storage_schema: Schema =
-            (&arrow_schema::Schema::new(vec![ROW_ID_FIELD.clone(), quantizer.field()]))
-                .try_into()?;
+        let mut fields = vec![ROW_ID_FIELD.clone(), quantizer.field()];
+        fields.extend(quantizer.extra_fields());
+        let storage_schema: Schema = (&arrow_schema::Schema::new(fields)).try_into()?;
         let mut storage_writer = FileWriter::try_new(
             self.store.create(&storage_path).await?,
             storage_schema.clone(),
